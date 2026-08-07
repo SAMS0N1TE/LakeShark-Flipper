@@ -9,6 +9,6 @@ App(
     fap_category="GPIO",
     fap_icon="lakeshark_10px.png",
     fap_author="SAMS0N1TE",
-    fap_weburl="https://github.com/SAMS0N1TE/LakeSharkHead",
+    fap_weburl="https://github.com/SAMS0N1TE/LakeShark-Flipper",
     fap_description="Control head for the LakeShark ESP32-P4 SDR receiver over UART or Bluetooth",
 )
