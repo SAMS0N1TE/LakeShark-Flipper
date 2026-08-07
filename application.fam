@@ -1,6 +1,6 @@
 App(
     appid="lakeshark_p25",
-    name="LakeShark",
+    name="LakeShark SDR",
     apptype=FlipperAppType.EXTERNAL,
     entry_point="lakeshark_p25_app",
     requires=["gui", "storage", "notification"],
