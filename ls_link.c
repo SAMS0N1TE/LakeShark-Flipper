@@ -143,6 +143,21 @@ static void apply_kv(LsTelemetry* t, char* tok) {
     else if((v = kv(tok, "stl")))
         t->sdr_stall_s = atoi(v);
 
+    else if((v = kv(tok, "eq")))
+        t->eq_preset = atoi(v);
+    else if((v = kv(tok, "egr")))
+        t->eq_gr_db10 = atoi(v);
+    else if((v = kv(tok, "eh")))
+        t->eq_hp_hz = atoi(v);
+    else if((v = kv(tok, "eb")))
+        t->eq_bass_db = atoi(v);
+    else if((v = kv(tok, "et")))
+        t->eq_treb_db = atoi(v);
+    else if((v = kv(tok, "ep")))
+        t->eq_punch = atoi(v);
+    else if((v = kv(tok, "el")))
+        t->eq_loud = atoi(v);
+
     else if((v = kv(tok, "nac")))
         t->nac = atoi(v);
     else if((v = kv(tok, "tg")))
@@ -269,11 +284,29 @@ static void parse_telemetry(LsLink* link, char* line) {
     uint32_t carry_fi = t->free_internal;
     uint32_t carry_fd = t->free_dma;
 
+    int32_t carry_eq[7] = {
+        t->eq_preset,
+        t->eq_hp_hz,
+        t->eq_bass_db,
+        t->eq_treb_db,
+        t->eq_punch,
+        t->eq_loud,
+        t->eq_gr_db10,
+    };
+
     memset(t, 0, sizeof(*t));
     memcpy(t->ac, carry, sizeof(carry));
     t->uptime_s = carry_up;
     t->free_internal = carry_fi;
     t->free_dma = carry_fd;
+
+    t->eq_preset = carry_eq[0];
+    t->eq_hp_hz = carry_eq[1];
+    t->eq_bass_db = carry_eq[2];
+    t->eq_treb_db = carry_eq[3];
+    t->eq_punch = carry_eq[4];
+    t->eq_loud = carry_eq[5];
+    t->eq_gr_db10 = carry_eq[6];
 
     t->nac_age_ms = -1;
     t->tg_age_ms = -1;
@@ -308,8 +341,36 @@ static void parse_telemetry(LsLink* link, char* line) {
     furi_mutex_release(link->lock);
 }
 
+static void parse_eq_line(LsLink* link, char* line) {
+    LsTelemetry* t = &link->parsed;
+
+    char* p = line;
+    while(*p) {
+        while(*p == ' ' || *p == '\t')
+            p++;
+        if(!*p) break;
+        char* tok = p;
+        while(*p && *p != ' ' && *p != '\t')
+            p++;
+        if(*p) *p++ = '\0';
+        apply_kv(t, tok);
+    }
+
+    furi_mutex_acquire(link->lock, FuriWaitForever);
+    link->tel.eq_preset = t->eq_preset;
+    link->tel.eq_hp_hz = t->eq_hp_hz;
+    link->tel.eq_bass_db = t->eq_bass_db;
+    link->tel.eq_treb_db = t->eq_treb_db;
+    link->tel.eq_punch = t->eq_punch;
+    link->tel.eq_loud = t->eq_loud;
+    link->tel.eq_gr_db10 = t->eq_gr_db10;
+    furi_mutex_release(link->lock);
+}
+
 static void handle_line(LsLink* link, char* line) {
-    if(line[0] == '$') {
+    if(line[0] == '&') {
+        parse_eq_line(link, line + 1);
+    } else if(line[0] == '$') {
 
         if((link->frames % 25) == 0) FURI_LOG_I(TAG, "rx frame: %s", line);
         parse_telemetry(link, line + 1);

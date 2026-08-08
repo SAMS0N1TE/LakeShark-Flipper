@@ -63,6 +63,14 @@ typedef struct {
 
     int32_t sdr_stall_s;
 
+    int32_t eq_preset;
+    int32_t eq_hp_hz;
+    int32_t eq_bass_db;
+    int32_t eq_treb_db;
+    int32_t eq_punch;
+    int32_t eq_loud;
+    int32_t eq_gr_db10;
+
     int32_t demod_mode;
     char demod_name[16];
     int32_t nac;

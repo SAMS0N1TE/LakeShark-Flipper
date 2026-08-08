@@ -40,6 +40,26 @@ static const char* const STEP_NAMES[] =
 static const int GAINS[] = {0, 90, 200, 280, 340, 370, 400, 437, 463, 496};
 #define N_GAINS ((int)(sizeof(GAINS) / sizeof(GAINS[0])))
 
+static const char* const EQ_PRESET_NAMES[] = {"flat", "voice", "punch", "full", "custom"};
+#define EQ_PRESET_COUNT ((int)(sizeof(EQ_PRESET_NAMES) / sizeof(EQ_PRESET_NAMES[0])))
+
+static const char* const EQ_LOUD_NAMES[] = {"off", "low", "med", "high"};
+#define EQ_LOUD_COUNT ((int)(sizeof(EQ_LOUD_NAMES) / sizeof(EQ_LOUD_NAMES[0])))
+
+static const int EQ_HP_HZ[] = {0, 80, 120, 150, 180, 220, 260, 300, 400};
+#define EQ_HP_COUNT ((int)(sizeof(EQ_HP_HZ) / sizeof(EQ_HP_HZ[0])))
+
+static const char* const EQ_TEST_NAMES[] = {"sweep", "bass", "noise", "tone", "chirp", "moto"};
+static const char* const EQ_TEST_LABELS[] = {
+    "Sweep 70-4k",
+    "Bass ladder",
+    "Noise",
+    "1 kHz tone",
+    "P25 chirp",
+    "Moto alert",
+};
+#define EQ_TEST_COUNT ((int)(sizeof(EQ_TEST_NAMES) / sizeof(EQ_TEST_NAMES[0])))
+
 static const char* const DEMOD_NAMES[] = {"C4FM", "CQPSK", "DIF4FSK", "FSK4TRK"};
 
 static const ViewPortOrientation ORIENT_VP[LsOrientCount] = {
@@ -93,6 +113,7 @@ static const LsAppDef APPS[LsRadioCount] = {
 
 typedef enum {
     SET_LEVELS,
+    SET_AUDIO,
     SET_LINK,
     SET_DEVICE,
     SET_DISPLAY,
@@ -101,7 +122,7 @@ typedef enum {
 } LsSetPage;
 
 static const char* const SET_TITLES[SET_COUNT] =
-    {"LEVELS", "LINK", "DEVICE", "DISPLAY", "ABOUT"};
+    {"LEVELS", "AUDIO", "LINK", "DEVICE", "DISPLAY", "ABOUT"};
 
 typedef enum {
     LsScreenLauncher,
@@ -147,6 +168,12 @@ typedef enum {
     ECHO_GAIN,
     ECHO_SQL,
     ECHO_VGATE,
+    ECHO_EQ_PRESET,
+    ECHO_EQ_HP,
+    ECHO_EQ_BASS,
+    ECHO_EQ_TREB,
+    ECHO_EQ_PUNCH,
+    ECHO_EQ_LOUD,
     ECHO_COUNT,
 } LsEchoId;
 
@@ -173,8 +200,6 @@ typedef struct {
     int list_top;
 
     bool editing;
-
-    bool vfo_focus;
 
     char edit[12];
     int edit_pos;
@@ -544,7 +569,7 @@ static void enter_app(LsApp* app, LsRadioApp which) {
     app->page = 0;
     app->focus = 0;
     app->list_top = 0;
-    app->vfo_focus = false;
+    app->editing = false;
     app->screen = LsScreenApp;
     request_mode(app, which);
 
@@ -599,10 +624,87 @@ static void draw_focus_str(
     canvas_set_color(c, ColorBlack);
 }
 
+typedef enum {
+    VFO_FREQ,
+    VFO_STEP,
+    VFO_VOL,
+    VFO_GAIN,
+    VFO_SQL,
+    VFO_VGATE,
+    VFO_EQ,
+    VFO_MUTE,
+} LsVfoRow;
+
+#define VFO_ROW_MAX 8
+
+static int vfo_rows(LsApp* app, uint8_t* out) {
+    int n = 0;
+    out[n++] = VFO_FREQ;
+    out[n++] = VFO_STEP;
+    out[n++] = VFO_VOL;
+    out[n++] = VFO_GAIN;
+    if(app->app == LsRadioFm || app->app == LsRadioPocsag) out[n++] = VFO_SQL;
+    if(app->app == LsRadioP25) out[n++] = VFO_VGATE;
+    out[n++] = VFO_EQ;
+    out[n++] = VFO_MUTE;
+    return n;
+}
+
+static void draw_vfo_row(Canvas* c, LsApp* app, int kind, int y, bool sel, bool edit) {
+    LsTelemetry* t = &app->tel;
+    char v[24];
+
+    switch(kind) {
+    case VFO_STEP:
+        ls_ui_row_edit(c, y, "Step", STEP_NAMES[app->cfg.step_idx], sel, edit);
+        break;
+    case VFO_VOL: {
+        int32_t vol = echo_get(app, ECHO_VOL, t->volume);
+        snprintf(v, sizeof(v), "%ld%s", (long)vol, t->muted ? " M" : "");
+        ls_ui_level_edit(c, y, "Vol", v, clampi((int)vol, 0, 100), sel, edit);
+        break;
+    }
+    case VFO_GAIN: {
+        int32_t g = echo_get(app, ECHO_GAIN, t->gain_tenths);
+        snprintf(v, sizeof(v), "%ld.%ld", (long)(g / 10), (long)(g % 10));
+        ls_ui_level_edit(c, y, "Gain", v, clampi((int)(g * 100 / 496), 0, 100), sel, edit);
+        break;
+    }
+    case VFO_SQL: {
+        int32_t sq = echo_get(app, ECHO_SQL, t->squelch_tenths);
+        snprintf(v, sizeof(v), "%ld %s", (long)sq, t->squelch_open ? "OPEN" : "mute");
+        ls_ui_level_edit(c, y, "Sql", v, clampi((int)sq, 0, 100), sel, edit);
+        break;
+    }
+    case VFO_VGATE: {
+        int32_t vg = echo_get(app, ECHO_VGATE, t->voice_gate);
+        snprintf(v, sizeof(v), "%ld", (long)vg);
+        ls_ui_level_edit(c, y, "Vgate", v, clampi(((int)vg - 6) * 100 / 93, 0, 100), sel, edit);
+        break;
+    }
+    case VFO_EQ: {
+        int32_t p = echo_get(app, ECHO_EQ_PRESET, t->eq_preset);
+        ls_ui_row_edit(
+            c, y, "Audio", EQ_PRESET_NAMES[clampi((int)p, 0, EQ_PRESET_COUNT - 1)], sel, edit);
+        break;
+    }
+    case VFO_MUTE:
+        ls_ui_row_edit(c, y, "Mute", t->muted ? "ON" : "off", sel, false);
+        break;
+    default:
+        break;
+    }
+}
+
 static void draw_vfo(Canvas* c, LsApp* app) {
     LsTelemetry* t = &app->tel;
     const int w = canvas_width(c);
     const bool port = ls_ui_portrait(c);
+
+    uint8_t rows[VFO_ROW_MAX];
+    const int nrows = vfo_rows(app, rows);
+    if(app->focus < 0 || app->focus >= nrows) app->focus = 0;
+    const bool freq_sel = (app->focus == 0);
 
     char f[16];
     ls_ui_mhz(f, sizeof(f), t->freq_hz);
@@ -620,15 +722,14 @@ static void draw_vfo(Canvas* c, LsApp* app) {
             snprintf(whole, sizeof(whole), "%s", f);
         }
         canvas_set_font(c, FontBigNumbers);
-        if(app->vfo_focus) {
-
+        if(freq_sel) {
             draw_focus_str(c, w / 2, y + 12, AlignCenter, y + 1, 21, whole);
         } else {
             canvas_draw_str_aligned(c, w / 2, y + 12, AlignCenter, AlignCenter, whole);
         }
         canvas_set_font(c, FontPrimary);
         const char* frac = dot ? dot : "";
-        if(app->vfo_focus && frac[0]) {
+        if(freq_sel && frac[0]) {
             draw_focus_str(c, w / 2, y + 32, AlignBottom, y + 22, 11, frac);
         } else {
             canvas_draw_str_aligned(c, w / 2, y + 32, AlignCenter, AlignBottom, frac);
@@ -636,7 +737,7 @@ static void draw_vfo(Canvas* c, LsApp* app) {
         y += 36;
     } else {
         canvas_set_font(c, FontBigNumbers);
-        if(app->vfo_focus) {
+        if(freq_sel) {
             draw_focus_str(c, w / 2, y + 10, AlignCenter, y, 21, f);
         } else {
             canvas_draw_str_aligned(c, w / 2, y + 10, AlignCenter, AlignCenter, f);
@@ -654,70 +755,38 @@ static void draw_vfo(Canvas* c, LsApp* app) {
     canvas_draw_line(c, 0, y, w - 1, y);
     y += 2;
 
-    int32_t vol = echo_get(app, ECHO_VOL, t->volume);
-    char step_s[16], vol_s[16];
-    if(port) {
-        snprintf(step_s, sizeof(step_s), "%s", STEP_NAMES[app->cfg.step_idx]);
-        snprintf(vol_s, sizeof(vol_s), "V%ld%s", (long)vol, t->muted ? "M" : "");
-    } else {
-        snprintf(step_s, sizeof(step_s), "STEP %s", STEP_NAMES[app->cfg.step_idx]);
-        snprintf(vol_s, sizeof(vol_s), "VOL %ld%s", (long)vol, t->muted ? " MUTE" : "");
-    }
-
-    canvas_draw_box(c, 0, y, w, LS_ROW_H);
-    canvas_set_color(c, ColorWhite);
-    canvas_draw_str(c, 3, y + LS_ROW_H - 3, step_s);
-    canvas_draw_str_aligned(c, w - 3, y + LS_ROW_H - 3, AlignRight, AlignBottom, vol_s);
-    canvas_set_color(c, ColorBlack);
-    y += LS_ROW_H + 2;
-
     canvas_draw_str(c, 0, y + 6, "S");
     ls_ui_bar(c, 9, y + 1, w - 10, 6, signal_pct(t->iq_level));
-    y += 10;
+    y += 9;
 
-    if(app->app == LsRadioFm && y + LS_ROW_H <= body_full(c)) {
-        int32_t sq = echo_get(app, ECHO_SQL, t->squelch_tenths);
-        char sq_s[24];
-        snprintf(
-            sq_s,
-            sizeof(sq_s),
-            "%ld %s",
-            (long)sq,
-            t->squelch_open ? "OPEN" : "mute");
-        ls_ui_level(c, y, "Sql", sq_s, clampi((int)sq, 0, 100), !app->vfo_focus);
-        y += LS_ROW_H;
-    }
-
-    if(t->sdr_stall_s > 0 && y + LS_ROW_H <= body_full(c)) {
+    int bottom = body_full(c);
+    if(t->sdr_stall_s > 0 || !t->rtl_ready) {
         char l[32];
-        snprintf(l, sizeof(l), "SDR STALLED %lds", (long)t->sdr_stall_s);
-        canvas_draw_box(c, 0, y, w, LS_ROW_H);
-        canvas_set_color(c, ColorWhite);
-        canvas_draw_str(c, 3, y + LS_ROW_H - 3, l);
-        canvas_set_color(c, ColorBlack);
-        return;
-    }
-
-    if(!port && y + 8 <= body_full(c)) {
-        char l[32];
-        if(app->app == LsRadioP25) {
-            char ta[8];
-            ls_ui_age(ta, sizeof(ta), t->tg_age_ms);
-            if(t->tg_age_ms >= 0) {
-                snprintf(l, sizeof(l), "TG %ld  %s", (long)t->tg, ta);
-            } else {
-                snprintf(l, sizeof(l), "TG ---");
-            }
+        if(!t->rtl_ready) {
+            snprintf(l, sizeof(l), "NO SDR");
         } else {
-            snprintf(
-                l,
-                sizeof(l),
-                "G%ld.%ld %s",
-                (long)(t->gain_tenths / 10),
-                (long)(t->gain_tenths % 10),
-                t->rtl_ready ? "" : "NOSDR");
+            snprintf(l, sizeof(l), "SDR STALLED %lds", (long)t->sdr_stall_s);
         }
-        canvas_draw_str(c, 0, y + 8, l);
+        bottom -= LS_ROW_H;
+        canvas_draw_box(c, 0, bottom, w, LS_ROW_H);
+        canvas_set_color(c, ColorWhite);
+        canvas_draw_str(c, 3, bottom + LS_ROW_H - 3, l);
+        canvas_set_color(c, ColorBlack);
+    }
+
+    const int list_n = nrows - 1;
+    int visible = (bottom - y) / LS_ROW_H;
+    if(visible < 1) visible = 1;
+    if(visible > list_n) visible = list_n;
+
+    int sel = freq_sel ? 0 : app->focus - 1;
+    ls_ui_scroll(&app->list_top, sel, list_n, visible);
+
+    for(int r = 0; r < visible; r++) {
+        int i = app->list_top + r;
+        if(i >= list_n) break;
+        const bool rsel = !freq_sel && (i == sel);
+        draw_vfo_row(c, app, rows[i + 1], y + r * LS_ROW_H, rsel, rsel && app->editing);
     }
 }
 
@@ -1328,6 +1397,119 @@ static void draw_set_levels(Canvas* c, LsApp* app) {
 }
 
 typedef enum {
+    AUD_PRESET,
+    AUD_BASS,
+    AUD_TREB,
+    AUD_PUNCH,
+    AUD_RUMBLE,
+    AUD_LOUD,
+    AUD_GR,
+    AUD_TESTS,
+    AUD_TEST0,
+    AUD_COUNT = AUD_TEST0 + EQ_TEST_COUNT,
+} LsAudioRow;
+
+static int eq_hp_index(int hz) {
+    int best = 0;
+    int bestd = 100000;
+    for(int i = 0; i < EQ_HP_COUNT; i++) {
+        int d = EQ_HP_HZ[i] > hz ? EQ_HP_HZ[i] - hz : hz - EQ_HP_HZ[i];
+        if(d < bestd) {
+            bestd = d;
+            best = i;
+        }
+    }
+    return best;
+}
+
+static void draw_set_audio(Canvas* c, LsApp* app) {
+    LsTelemetry* t = &app->tel;
+    canvas_set_font(c, FontSecondary);
+
+    const int32_t preset = echo_get(app, ECHO_EQ_PRESET, t->eq_preset);
+    const int32_t bass = echo_get(app, ECHO_EQ_BASS, t->eq_bass_db);
+    const int32_t treb = echo_get(app, ECHO_EQ_TREB, t->eq_treb_db);
+    const int32_t punch = echo_get(app, ECHO_EQ_PUNCH, t->eq_punch);
+    const int32_t hp = echo_get(app, ECHO_EQ_HP, t->eq_hp_hz);
+    const int32_t loud = echo_get(app, ECHO_EQ_LOUD, t->eq_loud);
+
+    const int rows = (body_full(c) - body_top()) / LS_ROW_H;
+    ls_ui_scroll(&app->list_top, app->focus, AUD_COUNT, rows);
+
+    char v[20];
+    for(int r = 0; r < rows; r++) {
+        int i = app->list_top + r;
+        if(i >= AUD_COUNT) break;
+
+        const int y = body_top() + r * LS_ROW_H;
+        const bool sel = (app->focus == i);
+        const bool edit = app->editing && sel;
+        v[0] = '\0';
+
+        switch(i) {
+        case AUD_PRESET:
+            ls_ui_row_edit(
+                c,
+                y,
+                "Profile",
+                EQ_PRESET_NAMES[clampi((int)preset, 0, EQ_PRESET_COUNT - 1)],
+                sel,
+                edit);
+            break;
+        case AUD_BASS:
+            snprintf(v, sizeof(v), "%+ld dB", (long)bass);
+            ls_ui_level_edit(
+                c, y, "Bass", v, clampi(((int)bass + 6) * 100 / 18, 0, 100), sel, edit);
+            break;
+        case AUD_TREB:
+            snprintf(v, sizeof(v), "%+ld dB", (long)treb);
+            ls_ui_level_edit(
+                c, y, "Treble", v, clampi(((int)treb + 8) * 100 / 16, 0, 100), sel, edit);
+            break;
+        case AUD_PUNCH:
+            snprintf(v, sizeof(v), "%ld", (long)punch);
+            ls_ui_level_edit(c, y, "Punch", v, clampi((int)punch, 0, 100), sel, edit);
+            break;
+        case AUD_RUMBLE:
+            if(hp <= 0)
+                snprintf(v, sizeof(v), "off");
+            else
+                snprintf(v, sizeof(v), "%ld Hz", (long)hp);
+            ls_ui_row_edit(c, y, "Rumble cut", v, sel, edit);
+            break;
+        case AUD_LOUD:
+            ls_ui_row_edit(
+                c,
+                y,
+                "Loudness",
+                EQ_LOUD_NAMES[clampi((int)loud, 0, EQ_LOUD_COUNT - 1)],
+                sel,
+                edit);
+            break;
+        case AUD_GR: {
+            int gr = t->eq_gr_db10;
+            if(gr > 0)
+                snprintf(v, sizeof(v), "-%d.%d dB", gr / 10, gr % 10);
+            else
+                snprintf(v, sizeof(v), "0.0 dB");
+            ls_ui_row(c, y, "Limiter", v, sel);
+            break;
+        }
+        case AUD_TESTS:
+            ls_ui_divider_row(c, y, "TESTS");
+            break;
+        default:
+            if(i >= AUD_TEST0 && i < AUD_TEST0 + EQ_TEST_COUNT) {
+                ls_ui_row(c, y, EQ_TEST_LABELS[i - AUD_TEST0], "play", sel);
+            }
+            break;
+        }
+    }
+
+    elements_scrollbar(c, app->focus, AUD_COUNT);
+}
+
+typedef enum {
     LNK_TRANSPORT,
     LNK_BT_RADIO,
     LNK_PAIR,
@@ -1698,6 +1880,9 @@ static void draw_settings_page(Canvas* c, LsApp* app) {
     case SET_LEVELS:
         draw_set_levels(c, app);
         break;
+    case SET_AUDIO:
+        draw_set_audio(c, app);
+        break;
     case SET_LINK:
         draw_set_link(c, app);
         break;
@@ -1821,8 +2006,104 @@ static void adjust_level(LsApp* app, LsLevel which, int dir) {
     }
 }
 
+static void eq_cycle_preset(LsApp* app, int dir) {
+    int p = (int)echo_get(app, ECHO_EQ_PRESET, app->tel.eq_preset);
+    p = (p + dir + EQ_PRESET_COUNT) % EQ_PRESET_COUNT;
+    ls_link_send(app->link, "EQ %s", EQ_PRESET_NAMES[p]);
+    echo_set(app, ECHO_EQ_PRESET, p);
+    for(int i = ECHO_EQ_HP; i <= ECHO_EQ_LOUD; i++) app->echo[i].active = false;
+}
+
+static void adjust_audio(LsApp* app, int dir) {
+    LsTelemetry* t = &app->tel;
+
+    switch(app->focus) {
+    case AUD_PRESET:
+        eq_cycle_preset(app, dir);
+        break;
+    case AUD_BASS: {
+        int v = clampi((int)echo_get(app, ECHO_EQ_BASS, t->eq_bass_db) + dir, -6, 12);
+        ls_link_send(app->link, "EQ BASS %d", v);
+        echo_set(app, ECHO_EQ_BASS, v);
+        echo_set(app, ECHO_EQ_PRESET, EQ_PRESET_COUNT - 1);
+        break;
+    }
+    case AUD_TREB: {
+        int v = clampi((int)echo_get(app, ECHO_EQ_TREB, t->eq_treb_db) + dir, -8, 8);
+        ls_link_send(app->link, "EQ TREB %d", v);
+        echo_set(app, ECHO_EQ_TREB, v);
+        echo_set(app, ECHO_EQ_PRESET, EQ_PRESET_COUNT - 1);
+        break;
+    }
+    case AUD_PUNCH: {
+        int v = clampi((int)echo_get(app, ECHO_EQ_PUNCH, t->eq_punch) + 5 * dir, 0, 100);
+        ls_link_send(app->link, "EQ PUNCH %d", v);
+        echo_set(app, ECHO_EQ_PUNCH, v);
+        echo_set(app, ECHO_EQ_PRESET, EQ_PRESET_COUNT - 1);
+        break;
+    }
+    case AUD_RUMBLE: {
+        int idx = eq_hp_index((int)echo_get(app, ECHO_EQ_HP, t->eq_hp_hz));
+        idx = clampi(idx + dir, 0, EQ_HP_COUNT - 1);
+        ls_link_send(app->link, "EQ HP %d", EQ_HP_HZ[idx]);
+        echo_set(app, ECHO_EQ_HP, EQ_HP_HZ[idx]);
+        echo_set(app, ECHO_EQ_PRESET, EQ_PRESET_COUNT - 1);
+        break;
+    }
+    case AUD_LOUD: {
+        int v = clampi((int)echo_get(app, ECHO_EQ_LOUD, t->eq_loud) + dir, 0, EQ_LOUD_COUNT - 1);
+        ls_link_send(app->link, "EQ LOUD %d", v);
+        echo_set(app, ECHO_EQ_LOUD, v);
+        echo_set(app, ECHO_EQ_PRESET, EQ_PRESET_COUNT - 1);
+        break;
+    }
+    default:
+        break;
+    }
+}
+
 static void vfo_tune(LsApp* app, int dir) {
     ls_link_send(app->link, "TUNE %ld", (long)((int32_t)STEPS[app->cfg.step_idx] * dir));
+}
+
+static bool vfo_row_is_value(int kind) {
+    return kind != VFO_MUTE;
+}
+
+static void vfo_adjust(LsApp* app, int kind, int dir) {
+    switch(kind) {
+    case VFO_FREQ:
+        vfo_tune(app, dir);
+        break;
+    case VFO_STEP:
+        app->cfg.step_idx = (app->cfg.step_idx + dir + N_STEPS) % N_STEPS;
+        ls_cfg_save(&app->cfg);
+        break;
+    case VFO_VOL:
+        adjust_level(app, LVL_VOL, dir);
+        break;
+    case VFO_GAIN:
+        adjust_gain(app, dir);
+        break;
+    case VFO_SQL:
+        adjust_level(app, LVL_SQL, dir);
+        break;
+    case VFO_VGATE:
+        adjust_level(app, LVL_VGATE, dir);
+        break;
+    case VFO_EQ:
+        eq_cycle_preset(app, dir);
+        break;
+    default:
+        break;
+    }
+}
+
+static void vfo_action(LsApp* app, int kind) {
+    if(kind == VFO_MUTE) {
+        ls_link_send(app->link, "MUTE");
+        toast(app, app->tel.muted ? "Unmute" : "Mute");
+    }
 }
 
 static void device_action(LsApp* app, int row) {
@@ -1877,6 +2158,8 @@ static bool settings_row_is_value(LsApp* app) {
     switch(app->set_page) {
     case SET_LEVELS:
         return app->focus >= 0 && app->focus < LVL_COUNT;
+    case SET_AUDIO:
+        return app->focus >= 0 && app->focus < AUD_GR;
     case SET_LINK:
         return app->focus == LNK_TEL;
     case SET_DISPLAY:
@@ -1891,6 +2174,10 @@ static void settings_adjust(LsApp* app, int dir) {
     switch(app->set_page) {
     case SET_LEVELS:
         adjust_level(app, (LsLevel)app->focus, dir);
+        break;
+
+    case SET_AUDIO:
+        adjust_audio(app, dir);
         break;
 
     case SET_LINK:
@@ -1961,21 +2248,22 @@ static void handle_app(LsApp* app, InputEvent* ev, bool press) {
     const LsAppDef* d = &APPS[app->app];
     LsPage pg = cur_page(app);
 
-    if(pg == PG_VFO && app->vfo_focus) {
+    if(pg == PG_VFO && app->editing) {
+        uint8_t rows[VFO_ROW_MAX];
+        const int nrows = vfo_rows(app, rows);
+        const int kind = rows[clampi(app->focus, 0, nrows - 1)];
+
         bool handled = true;
-        if(press && ev->key == InputKeyUp) {
-            vfo_tune(app, +1);
-        } else if(press && ev->key == InputKeyDown) {
-            vfo_tune(app, -1);
-        } else if(press && ev->key == InputKeyLeft) {
-            adjust_level(app, LVL_VOL, -1);
-        } else if(press && ev->key == InputKeyRight) {
-            adjust_level(app, LVL_VOL, +1);
+        if(press && (ev->key == InputKeyUp || ev->key == InputKeyRight)) {
+            vfo_adjust(app, kind, +1);
+        } else if(press && (ev->key == InputKeyDown || ev->key == InputKeyLeft)) {
+            vfo_adjust(app, kind, -1);
         } else if(
             ev->type == InputTypeShort && (ev->key == InputKeyOk || ev->key == InputKeyBack)) {
-            app->vfo_focus = false;
+            app->editing = false;
         } else if(ev->type == InputTypeLong && ev->key == InputKeyOk) {
-            edit_begin(app);
+            app->editing = false;
+            if(kind == VFO_FREQ) edit_begin(app);
         } else {
             handled = false;
         }
@@ -1986,18 +2274,21 @@ static void handle_app(LsApp* app, InputEvent* ev, bool press) {
         app->page = (app->page + 1) % d->n_pages;
         app->focus = 0;
         app->list_top = 0;
+        app->editing = false;
         return;
     }
     if(press && ev->key == InputKeyLeft) {
         app->page = (app->page + d->n_pages - 1) % d->n_pages;
         app->focus = 0;
         app->list_top = 0;
+        app->editing = false;
         return;
     }
     if(ev->type == InputTypeShort && ev->key == InputKeyBack) {
         app->screen = LsScreenLauncher;
         app->focus = (int)app->app;
         app->list_top = 0;
+        app->editing = false;
         return;
     }
 
@@ -2007,14 +2298,23 @@ static void handle_app(LsApp* app, InputEvent* ev, bool press) {
     const bool ok_long = ev->type == InputTypeLong && ev->key == InputKeyOk;
 
     switch(pg) {
-    case PG_VFO:
+    case PG_VFO: {
+        uint8_t rows[VFO_ROW_MAX];
+        const int nrows = vfo_rows(app, rows);
+        if(up) app->focus = (app->focus + nrows - 1) % nrows;
+        if(down) app->focus = (app->focus + 1) % nrows;
 
-        if((up || down) && app->app == LsRadioFm && !app->vfo_focus) {
-            adjust_level(app, LVL_SQL, up ? +1 : -1);
+        const int kind = rows[clampi(app->focus, 0, nrows - 1)];
+        if(ok) {
+            if(vfo_row_is_value(kind)) {
+                app->editing = true;
+            } else {
+                vfo_action(app, kind);
+            }
         }
-        if(ok) app->vfo_focus = true;
-        if(ok_long) edit_begin(app);
+        if(ok_long && kind == VFO_FREQ) edit_begin(app);
         break;
+    }
 
     case PG_SIGNAL:
 
@@ -2217,6 +2517,13 @@ static void handle_settings(LsApp* app, InputEvent* ev, bool press) {
         if(up) app->focus = (app->focus + LVL_COUNT - 1) % LVL_COUNT;
         if(down) app->focus = (app->focus + 1) % LVL_COUNT;
         break;
+    case SET_AUDIO:
+        if(up || down) {
+            int dir = up ? -1 : +1;
+            app->focus = (app->focus + AUD_COUNT + dir) % AUD_COUNT;
+            if(app->focus == AUD_TESTS) app->focus = (app->focus + AUD_COUNT + dir) % AUD_COUNT;
+        }
+        break;
     case SET_LINK:
         if(up) app->focus = (app->focus + LNK_COUNT - 1) % LNK_COUNT;
         if(down) app->focus = (app->focus + 1) % LNK_COUNT;
@@ -2260,6 +2567,12 @@ static void handle_settings(LsApp* app, InputEvent* ev, bool press) {
             }
         } else if(app->set_page == SET_DEVICE) {
             device_action(app, app->focus);
+        } else if(
+            app->set_page == SET_AUDIO && app->focus >= AUD_TEST0 &&
+            app->focus < AUD_TEST0 + EQ_TEST_COUNT) {
+            int k = app->focus - AUD_TEST0;
+            ls_link_send(app->link, "TEST %s", EQ_TEST_NAMES[k]);
+            toast(app, "%s", EQ_TEST_LABELS[k]);
         }
     }
 
