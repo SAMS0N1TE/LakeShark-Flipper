@@ -6,11 +6,11 @@ This is LakeShark Flipper Edition, which is basically a control head for the Lak
 ## What it do
 
 I've added four receivers and all of them are a work in progress. I will try to rate them below for your expectations. I will continue to refine these and will update this table. 
- - 8/7/2026
+ - 8/8/2026
 
 | Receivers | Status |
 | --- | --- |
-| P25 | C |
+| P25 | B- |
 | FM | C- |
 | POCSAG | Untested |
 | ADS-B | F |
