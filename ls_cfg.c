@@ -10,6 +10,7 @@ const char* const LS_BOOT_NAMES[LsBootCount] = {
     "FM",
     "POCSAG",
     "ADS-B",
+    "REC",
 };
 
 const char* const LS_ORIENT_NAMES[LsOrientCount] = {

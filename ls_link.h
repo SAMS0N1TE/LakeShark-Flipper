@@ -18,8 +18,19 @@ typedef enum {
     LsModeP25,
     LsModeFm,
     LsModeAdsb,
+    LsModeRec,
     LsModeUnknown,
 } LsMode;
+
+typedef enum {
+    LsRecIdle,
+    LsRecArmed,
+    LsRecCapturing,
+    LsRecDone,
+} LsRecPhase;
+
+#define LS_REC_MAX_EDGES 4096
+#define LS_REC_CHUNK 32
 
 typedef enum {
     LsFmListen,
@@ -115,6 +126,17 @@ typedef struct {
     char pocsag_last_type[4];
     char pocsag_last_text[80];
 
+    int32_t rec_phase;
+    int32_t rec_edges;
+    uint32_t rec_span_us;
+    int32_t rec_mag;
+    int32_t rec_floor;
+    int32_t rec_thresh;
+    int32_t rec_thresh_fixed;
+    int32_t rec_gap_ms;
+    uint32_t rec_captures;
+    char rec_last_file[24];
+
     int32_t ac_tracked;
     int32_t ac_count;
     int32_t msgs_total;
@@ -167,6 +189,10 @@ void ls_link_last_reply(LsLink* link, char* out, size_t out_len);
 uint32_t ls_link_reply_age_ms(LsLink* link);
 
 void ls_link_send(LsLink* link, const char* fmt, ...);
+
+bool ls_link_rec_take(LsLink* link, uint32_t* offset, int* count, int32_t* out, int max);
+
+void ls_link_rec_reset(LsLink* link);
 
 void ls_link_toggle_port(LsLink* link);
 

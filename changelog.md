@@ -1,3 +1,6 @@
+v2.3:
+Added the REC app: an OOK recorder driven from the Flipper. The record page arms and disarms the radio and adjusts frequency, gain, detector threshold and the silence gap that ends a capture, with a live magnitude and threshold readout for tuning. The capture page shows the pulse train and writes it to the Flipper as a SubGHz RAW .sub file in subghz/lakeshark, ready to replay from the SubGHz app.
+
 v2.1:
 Added squelch to the FM page with an open or muted readout, adjusted with up and down while the VFO is not focused for tuning. Added SDR health notifications so the head alerts when the receiver drops or goes silent, and again when it comes back. Slowed the receive flash and made it hold as a clean screen inversion instead of a single frame.
 

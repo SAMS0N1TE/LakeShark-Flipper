@@ -17,6 +17,7 @@ typedef enum {
     LsBootFm,
     LsBootPocsag,
     LsBootAdsb,
+    LsBootRec,
     LsBootCount,
 } LsBootApp;
 

@@ -73,6 +73,7 @@ typedef enum {
     LsRadioFm,
     LsRadioPocsag,
     LsRadioAdsb,
+    LsRadioRec,
     LsRadioCount,
 } LsRadioApp;
 
@@ -88,6 +89,8 @@ typedef enum {
     PG_TRAFFIC,
     PG_AIRCRAFT,
     PG_ADSB_STAT,
+    PG_REC,
+    PG_REC_CAP,
 } LsPage;
 
 typedef struct {
@@ -103,12 +106,14 @@ static const LsPage FM_PAGES[] = {PG_VFO, PG_SIGNAL, PG_FM_SCAN, PG_MEM, PG_DIAG
 
 static const LsPage POC_PAGES[] = {PG_POC, PG_POC_LOG, PG_MEM, PG_SIGNAL, PG_DIAG};
 static const LsPage ADSB_PAGES[] = {PG_TRAFFIC, PG_AIRCRAFT, PG_ADSB_STAT, PG_DIAG};
+static const LsPage REC_PAGES[] = {PG_REC, PG_REC_CAP, PG_MEM, PG_DIAG};
 
 static const LsAppDef APPS[LsRadioCount] = {
     {"P25", "p25", "MODE p25", P25_PAGES, (int)(sizeof(P25_PAGES) / sizeof(LsPage))},
     {"FM", "fm", "FM listen", FM_PAGES, (int)(sizeof(FM_PAGES) / sizeof(LsPage))},
     {"POCSAG", "pocsag", "FM pocsag", POC_PAGES, (int)(sizeof(POC_PAGES) / sizeof(LsPage))},
     {"ADS-B", "adsb", "MODE adsb", ADSB_PAGES, (int)(sizeof(ADSB_PAGES) / sizeof(LsPage))},
+    {"REC", "rec", "MODE rec", REC_PAGES, (int)(sizeof(REC_PAGES) / sizeof(LsPage))},
 };
 
 typedef enum {
@@ -174,6 +179,8 @@ typedef enum {
     ECHO_EQ_TREB,
     ECHO_EQ_PUNCH,
     ECHO_EQ_LOUD,
+    ECHO_REC_THRESH,
+    ECHO_REC_GAP,
     ECHO_COUNT,
 } LsEchoId;
 
@@ -237,10 +244,25 @@ typedef struct {
 
     uint32_t flash_until;
 
+    int32_t* rec_buf;
+    int rec_have;
+    int rec_total;
+    uint32_t rec_freq_hz;
+    int rec_xfer;
+    uint32_t rec_deadline;
+    int rec_retries;
+    int rec_view;
+    char rec_file[40];
+
     bool prev_voice;
     bool prev_sdr_bad;
     bool running;
 } LsApp;
+
+typedef enum {
+    RecXferIdle,
+    RecXferActive,
+} LsRecXfer;
 
 static void toast(LsApp* app, const char* fmt, ...) {
     va_list ap;
@@ -384,6 +406,15 @@ static const LsMem ADSB_PRESETS[] = {
     {"ADS-B 1090", 1090000000},
 };
 
+static const LsMem REC_PRESETS[] = {
+    {"OOK 433.92", 433920000},
+    {"OOK 315.00", 315000000},
+    {"OOK 345.00", 345000000},
+    {"OOK 390.00", 390000000},
+    {"OOK 868.35", 868350000},
+    {"OOK 915.00", 915000000},
+};
+
 #define PRESET_TABLE(t) t, (int)(sizeof(t) / sizeof(LsMem))
 static const struct {
     const LsMem* list;
@@ -393,6 +424,7 @@ static const struct {
     {PRESET_TABLE(FM_PRESETS)},
     {PRESET_TABLE(POC_PRESETS)},
     {PRESET_TABLE(ADSB_PRESETS)},
+    {PRESET_TABLE(REC_PRESETS)},
 };
 #undef PRESET_TABLE
 
@@ -556,6 +588,197 @@ static void poc_ingest(LsApp* app) {
     if(app->poc_count < POC_LOG_MAX) app->poc_count++;
 
     notification_message(app->notif, &sequence_blink_blue_10);
+}
+
+#define REC_SUB_ROOT "/ext/subghz"
+#define REC_SUB_DIR REC_SUB_ROOT "/lakeshark"
+#define REC_XFER_TIMEOUT_MS 900
+#define REC_XFER_RETRIES 6
+#define REC_LINE_VALUES 40
+
+static const char* const REC_PHASE_NAMES[] = {"idle", "armed", "capturing", "done"};
+
+static const char* rec_phase_name(LsApp* app) {
+    return REC_PHASE_NAMES[clampi((int)app->tel.rec_phase, 0, 3)];
+}
+
+static void rec_preview_clear(LsApp* app) {
+    if(app->rec_buf) {
+        free(app->rec_buf);
+        app->rec_buf = NULL;
+    }
+    app->rec_have = 0;
+    app->rec_total = 0;
+    app->rec_file[0] = '\0';
+}
+
+static bool rec_write_sub(LsApp* app, char* name_out, size_t name_len) {
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    storage_common_mkdir(storage, REC_SUB_ROOT);
+    storage_common_mkdir(storage, REC_SUB_DIR);
+
+    char path[96];
+    unsigned long khz = (unsigned long)(app->rec_freq_hz / 1000);
+    FileInfo info;
+    int idx = 1;
+    for(; idx < 1000; idx++) {
+        snprintf(path, sizeof(path), REC_SUB_DIR "/LS_%lu_%03d.sub", khz, idx);
+        if(storage_common_stat(storage, path, &info) != FSE_OK) break;
+    }
+
+    bool ok = false;
+    Stream* stream = file_stream_alloc(storage);
+    if(file_stream_open(stream, path, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
+        FuriString* s = furi_string_alloc();
+        furi_string_printf(
+            s,
+            "Filetype: Flipper SubGhz RAW File\n"
+            "Version: 1\n"
+            "Frequency: %lu\n"
+            "Preset: FuriHalSubGhzPresetOok650Async\n"
+            "Protocol: RAW\n",
+            (unsigned long)app->rec_freq_hz);
+        stream_write_string(stream, s);
+
+        int i = 0;
+        while(i < app->rec_have) {
+            furi_string_set_str(s, "RAW_Data:");
+            for(int k = 0; k < REC_LINE_VALUES && i < app->rec_have; k++, i++) {
+                furi_string_cat_printf(s, " %ld", (long)app->rec_buf[i]);
+            }
+            furi_string_cat_str(s, "\n");
+            stream_write_string(stream, s);
+        }
+        furi_string_free(s);
+        ok = true;
+    }
+
+    file_stream_close(stream);
+    stream_free(stream);
+    furi_record_close(RECORD_STORAGE);
+
+    if(ok && name_out && name_len) {
+        const char* base = strrchr(path, '/');
+        if(!base) base = path;
+        else base++;
+
+        size_t n = strlen(base);
+        if(n >= name_len) n = name_len - 1;
+        memcpy(name_out, base, n);
+        name_out[n] = '\0';
+    }
+    return ok;
+}
+
+static void rec_xfer_request(LsApp* app) {
+    ls_link_send(app->link, "REC GET %d", app->rec_have);
+    app->rec_deadline = furi_get_tick() + furi_ms_to_ticks(REC_XFER_TIMEOUT_MS);
+}
+
+static void rec_xfer_start(LsApp* app) {
+    if(app->rec_xfer != RecXferIdle) return;
+
+    if(!app->link_up) {
+        toast(app, "No radio");
+        return;
+    }
+    if(app->tel.rec_phase == LsRecCapturing) {
+        toast(app, "Still capturing");
+        return;
+    }
+
+    int total = (int)app->tel.rec_edges;
+    if(total <= 0) {
+        toast(app, "Nothing captured");
+        return;
+    }
+    if(total > LS_REC_MAX_EDGES) total = LS_REC_MAX_EDGES;
+
+    rec_preview_clear(app);
+    app->rec_buf = malloc(sizeof(int32_t) * (size_t)total);
+    if(!app->rec_buf) {
+        toast(app, "Out of memory");
+        return;
+    }
+
+    app->rec_total = total;
+    app->rec_have = 0;
+    app->rec_retries = 0;
+    app->rec_view = 0;
+    app->rec_freq_hz = app->tel.freq_hz;
+    app->rec_xfer = RecXferActive;
+
+    ls_link_rec_reset(app->link);
+    modal_set(app, "SAVING", "reading capture", NULL, 0);
+    rec_xfer_request(app);
+}
+
+static void rec_xfer_cancel(LsApp* app, const char* why) {
+    if(app->rec_xfer == RecXferIdle) return;
+    app->rec_xfer = RecXferIdle;
+    rec_preview_clear(app);
+    modal_clear(app);
+    if(why) toast(app, "%s", why);
+}
+
+static void rec_xfer_finish(LsApp* app) {
+    app->rec_xfer = RecXferIdle;
+    modal_clear(app);
+
+    char name[40];
+    if(app->rec_have > 0 && rec_write_sub(app, name, sizeof(name))) {
+        snprintf(app->rec_file, sizeof(app->rec_file), "%s", name);
+        modal_set(app, "SAVED", name, "subghz/lakeshark", 2500);
+        notification_message(app->notif, &sequence_success);
+    } else {
+        rec_preview_clear(app);
+        toast(app, "Save failed");
+    }
+}
+
+static void rec_xfer_tick(LsApp* app) {
+    if(app->rec_xfer != RecXferActive) return;
+
+    uint32_t off = 0;
+    int count = 0;
+    int32_t chunk[LS_REC_CHUNK];
+
+    while(ls_link_rec_take(app->link, &off, &count, chunk, LS_REC_CHUNK)) {
+        if((int)off != app->rec_have) continue;
+
+        if(count == 0) {
+            rec_xfer_finish(app);
+            return;
+        }
+        for(int i = 0; i < count && app->rec_have < app->rec_total; i++) {
+            app->rec_buf[app->rec_have++] = chunk[i];
+        }
+        app->rec_retries = 0;
+        if(app->rec_have >= app->rec_total) {
+            rec_xfer_finish(app);
+            return;
+        }
+
+        char prog[24];
+        snprintf(
+            prog,
+            sizeof(prog),
+            "%d / %d",
+            clampi(app->rec_have, 0, LS_REC_MAX_EDGES),
+            clampi(app->rec_total, 0, LS_REC_MAX_EDGES));
+        modal_set(app, "SAVING", "reading capture", prog, 0);
+
+        rec_xfer_request(app);
+        return;
+    }
+
+    if(furi_get_tick() >= app->rec_deadline) {
+        if(++app->rec_retries > REC_XFER_RETRIES) {
+            rec_xfer_cancel(app, "Transfer failed");
+            return;
+        }
+        rec_xfer_request(app);
+    }
 }
 
 static void request_mode(LsApp* app, LsRadioApp which) {
@@ -1289,6 +1512,147 @@ static void draw_adsb_stat(Canvas* c, LsApp* app) {
     draw_status_line(c, "1090.000 MHz, fixed");
 }
 
+typedef enum {
+    REC_ROW_ARM,
+    REC_ROW_FREQ,
+    REC_ROW_GAIN,
+    REC_ROW_THRESH,
+    REC_ROW_GAP,
+    REC_ROW_COUNT,
+} LsRecRow;
+
+static void rec_row_value(LsApp* app, int row, char* out, size_t len) {
+    LsTelemetry* t = &app->tel;
+
+    switch(row) {
+    case REC_ROW_ARM:
+        snprintf(out, len, "%s", app->link_up ? rec_phase_name(app) : "---");
+        break;
+    case REC_ROW_FREQ:
+        ls_ui_mhz(out, len, t->freq_hz);
+        break;
+    case REC_ROW_GAIN: {
+        int32_t g = echo_get(app, ECHO_GAIN, t->gain_tenths);
+        if(g <= 0) {
+            snprintf(out, len, "auto");
+        } else {
+            snprintf(out, len, "%ld.%ld", (long)(g / 10), (long)(g % 10));
+        }
+        break;
+    }
+    case REC_ROW_THRESH: {
+        int32_t th = echo_get(app, ECHO_REC_THRESH, t->rec_thresh_fixed);
+        if(th <= 0) {
+            snprintf(out, len, "auto (%ld)", (long)t->rec_thresh);
+        } else {
+            snprintf(out, len, "%ld", (long)th);
+        }
+        break;
+    }
+    case REC_ROW_GAP: {
+        int32_t gp = echo_get(app, ECHO_REC_GAP, t->rec_gap_ms);
+        snprintf(out, len, "%ld ms", (long)gp);
+        break;
+    }
+    default:
+        out[0] = '\0';
+        break;
+    }
+}
+
+static void draw_rec(Canvas* c, LsApp* app) {
+    LsTelemetry* t = &app->tel;
+    canvas_set_font(c, FontSecondary);
+
+    static const char* const LABELS[REC_ROW_COUNT] =
+        {"Record", "Freq", "Gain", "Thresh", "Gap"};
+
+    const int rows = (body_bottom(c) - body_top()) / LS_ROW_H;
+    ls_ui_scroll(&app->list_top, app->focus, REC_ROW_COUNT, rows);
+
+    char v[24];
+    for(int r = 0; r < rows; r++) {
+        int i = app->list_top + r;
+        if(i >= REC_ROW_COUNT) break;
+
+        rec_row_value(app, i, v, sizeof(v));
+        int y = body_top() + r * LS_ROW_H;
+
+        if(i == REC_ROW_ARM) {
+            ls_ui_row(c, y, LABELS[i], v, i == app->focus);
+        } else {
+            ls_ui_row_edit(
+                c, y, LABELS[i], v, i == app->focus, app->editing && app->focus == i);
+        }
+    }
+    elements_scrollbar(c, app->focus, REC_ROW_COUNT);
+
+    static const char* const SHORT[] = {"idle", "arm", "cap", "done"};
+
+    int on = t->rec_thresh > 0 ? t->rec_thresh : 1;
+    snprintf(
+        v,
+        sizeof(v),
+        "%s e%ld %ld/%ld",
+        app->link_up ? SHORT[clampi((int)t->rec_phase, 0, 3)] : "no link",
+        (long)t->rec_edges,
+        (long)t->rec_mag,
+        (long)t->rec_thresh);
+    draw_status_line(c, v);
+
+    const int bw = 26;
+    const int bx = canvas_width(c) - bw - 2;
+    ls_ui_bar(c, bx, canvas_height(c) - 8, bw, 6, clampi((int)(t->rec_mag * 100 / (on * 2)), 0, 100));
+}
+
+static void draw_rec_wave(Canvas* c, LsApp* app, int x0, int y0, int w, int h) {
+    uint32_t total = 0;
+    for(int i = 0; i < app->rec_have; i++) total += (uint32_t)labs(app->rec_buf[i]);
+    if(!total) return;
+
+    uint32_t acc = 0;
+    for(int i = 0; i < app->rec_have; i++) {
+        uint32_t d = (uint32_t)labs(app->rec_buf[i]);
+        int xa = x0 + (int)(((uint64_t)acc * w) / total);
+        acc += d;
+        int xb = x0 + (int)(((uint64_t)acc * w) / total);
+
+        if(app->rec_buf[i] > 0) {
+            int ww = xb - xa;
+            if(ww < 1) ww = 1;
+            canvas_draw_box(c, xa, y0, ww, h);
+        }
+    }
+    canvas_draw_line(c, x0, y0 + h, x0 + w - 1, y0 + h);
+}
+
+static void draw_rec_cap(Canvas* c, LsApp* app) {
+    LsTelemetry* t = &app->tel;
+    canvas_set_font(c, FontSecondary);
+
+    char v[32];
+    int y = body_top();
+
+    snprintf(v, sizeof(v), "%ld", (long)t->rec_edges);
+    ls_ui_row(c, y, "Edges", v, false);
+    y += LS_ROW_H;
+
+    snprintf(v, sizeof(v), "%lu ms", (unsigned long)(t->rec_span_us / 1000));
+    ls_ui_row(c, y, "Span", v, false);
+    y += LS_ROW_H;
+
+    if(app->rec_buf && app->rec_have > 0) {
+        draw_rec_wave(c, app, 2, y + 1, canvas_width(c) - 4, 10);
+        draw_status_line(c, app->rec_file[0] ? app->rec_file : "OK saves .sub");
+    } else if(t->rec_phase == LsRecDone && t->rec_edges > 0) {
+        canvas_draw_str(c, 2, y + 9, "OK to save to SubGHz");
+        draw_status_line(c, "OK saves .sub");
+    } else {
+        canvas_draw_str(c, 2, y + 9, "Arm and transmit");
+        draw_status_line(c, app->link_up ? rec_phase_name(app) : "no link");
+    }
+}
+
 static void draw_launcher(Canvas* c, LsApp* app) {
     canvas_set_font(c, FontSecondary);
 
@@ -1833,6 +2197,10 @@ static const char* page_title(LsApp* app) {
         return "AIRCRAFT";
     case PG_ADSB_STAT:
         return "STATS";
+    case PG_REC:
+        return "RECORD";
+    case PG_REC_CAP:
+        return "CAPTURE";
     }
     return "?";
 }
@@ -1871,6 +2239,12 @@ static void draw_app_page(Canvas* c, LsApp* app) {
         break;
     case PG_ADSB_STAT:
         draw_adsb_stat(c, app);
+        break;
+    case PG_REC:
+        draw_rec(c, app);
+        break;
+    case PG_REC_CAP:
+        draw_rec_cap(c, app);
         break;
     }
 }
@@ -2099,6 +2473,50 @@ static void vfo_adjust(LsApp* app, int kind, int dir) {
     }
 }
 
+static void rec_adjust(LsApp* app, int row, int dir) {
+    LsTelemetry* t = &app->tel;
+
+    switch(row) {
+    case REC_ROW_FREQ:
+        vfo_tune(app, dir);
+        break;
+    case REC_ROW_GAIN:
+        adjust_gain(app, dir);
+        break;
+    case REC_ROW_THRESH: {
+        int v = clampi((int)echo_get(app, ECHO_REC_THRESH, t->rec_thresh_fixed) + 2 * dir, 0, 254);
+        ls_link_send(app->link, "REC THRESH %d", v);
+        echo_set(app, ECHO_REC_THRESH, v);
+        break;
+    }
+    case REC_ROW_GAP: {
+        int cur = (int)echo_get(app, ECHO_REC_GAP, t->rec_gap_ms);
+        int step = cur >= 100 ? 20 : 5;
+        int v = clampi(cur + step * dir, 2, 2000);
+        ls_link_send(app->link, "REC GAP %d", v);
+        echo_set(app, ECHO_REC_GAP, v);
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+static void rec_toggle_arm(LsApp* app) {
+    if(!app->link_up) {
+        toast(app, "No radio");
+        return;
+    }
+    if(app->tel.rec_phase == LsRecArmed || app->tel.rec_phase == LsRecCapturing) {
+        ls_link_send(app->link, "REC STOP");
+        toast(app, "Disarmed");
+    } else {
+        rec_preview_clear(app);
+        ls_link_send(app->link, "REC ARM");
+        toast(app, "Armed - transmit now");
+    }
+}
+
 static void vfo_action(LsApp* app, int kind) {
     if(kind == VFO_MUTE) {
         ls_link_send(app->link, "MUTE");
@@ -2264,6 +2682,24 @@ static void handle_app(LsApp* app, InputEvent* ev, bool press) {
         } else if(ev->type == InputTypeLong && ev->key == InputKeyOk) {
             app->editing = false;
             if(kind == VFO_FREQ) edit_begin(app);
+        } else {
+            handled = false;
+        }
+        if(handled) return;
+    }
+
+    if(pg == PG_REC && app->editing) {
+        bool handled = true;
+        if(press && (ev->key == InputKeyUp || ev->key == InputKeyRight)) {
+            rec_adjust(app, app->focus, +1);
+        } else if(press && (ev->key == InputKeyDown || ev->key == InputKeyLeft)) {
+            rec_adjust(app, app->focus, -1);
+        } else if(
+            ev->type == InputTypeShort && (ev->key == InputKeyOk || ev->key == InputKeyBack)) {
+            app->editing = false;
+        } else if(ev->type == InputTypeLong && ev->key == InputKeyOk) {
+            app->editing = false;
+            if(app->focus == REC_ROW_FREQ) edit_begin(app);
         } else {
             handled = false;
         }
@@ -2461,6 +2897,39 @@ static void handle_app(LsApp* app, InputEvent* ev, bool press) {
             toast(app, "Gain -> auto");
         }
         break;
+
+    case PG_REC:
+        if(up) app->focus = (app->focus + REC_ROW_COUNT - 1) % REC_ROW_COUNT;
+        if(down) app->focus = (app->focus + 1) % REC_ROW_COUNT;
+        if(ok) {
+            if(app->focus == REC_ROW_ARM) {
+                rec_toggle_arm(app);
+            } else {
+                app->editing = true;
+            }
+        }
+        if(ok_long) {
+            if(app->focus == REC_ROW_FREQ) {
+                edit_begin(app);
+            } else if(app->focus == REC_ROW_THRESH) {
+                ls_link_send(app->link, "REC THRESH 0");
+                echo_set(app, ECHO_REC_THRESH, 0);
+                toast(app, "Threshold auto");
+            } else if(app->focus == REC_ROW_GAIN) {
+                ls_link_send(app->link, "GAIN AUTO");
+                echo_set(app, ECHO_GAIN, 0);
+                toast(app, "Gain -> auto");
+            }
+        }
+        break;
+
+    case PG_REC_CAP:
+        if(ok) rec_xfer_start(app);
+        if(ok_long) {
+            rec_preview_clear(app);
+            toast(app, "Preview cleared");
+        }
+        break;
     }
 
     if(ev->type == InputTypeLong && ev->key == InputKeyBack) {
@@ -2610,6 +3079,7 @@ static void handle_input(LsApp* app, InputEvent* ev) {
     if(modal_active(app)) {
         if(ev->type == InputTypeShort &&
            (ev->key == InputKeyBack || ev->key == InputKeyOk)) {
+            if(app->rec_xfer == RecXferActive) rec_xfer_cancel(app, "Transfer cancelled");
             modal_clear(app);
             app->pending_mode[0] = '\0';
         }
@@ -2697,7 +3167,7 @@ int32_t lakeshark_p25_app(void* p) {
     InputEvent ev;
     while(app->running) {
 
-        uint32_t wait = REDRAW_MS;
+        uint32_t wait = app->rec_xfer == RecXferActive ? 10 : REDRAW_MS;
         if(app->flash_until) {
             uint32_t now = furi_get_tick();
             uint32_t left = app->flash_until - now;
@@ -2727,6 +3197,8 @@ int32_t lakeshark_p25_app(void* p) {
         if(!had && app->have_tel) toast(app, "Linked to LakeShark");
 
         if(app->have_tel) poc_ingest(app);
+
+        rec_xfer_tick(app);
 
         uint32_t frames = 0;
         ls_link_stats(app->link, &frames, NULL, NULL);
@@ -2846,6 +3318,7 @@ int32_t lakeshark_p25_app(void* p) {
 
     ls_cfg_save(&app->cfg);
     ls_link_free(app->link);
+    rec_preview_clear(app);
 
     gui_remove_view_port(app->gui, app->vp);
     view_port_free(app->vp);
