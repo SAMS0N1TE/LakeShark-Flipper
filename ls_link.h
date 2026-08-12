@@ -135,6 +135,14 @@ typedef struct {
     int32_t rec_thresh_fixed;
     int32_t rec_gap_ms;
     uint32_t rec_captures;
+    uint32_t rec_bw_hz;
+    uint32_t rec_min_pulse_us;
+    uint32_t rec_max_span_us;
+    int32_t rec_min_edges;
+    int32_t rec_end_reason;
+    uint32_t rec_min_mark_us;
+    uint32_t rec_max_mark_us;
+    uint32_t rec_baud_est;
     char rec_last_file[24];
 
     int32_t ac_tracked;

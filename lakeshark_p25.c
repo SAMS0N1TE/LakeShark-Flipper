@@ -90,6 +90,7 @@ typedef enum {
     PG_AIRCRAFT,
     PG_ADSB_STAT,
     PG_REC,
+    PG_REC_SIG,
     PG_REC_CAP,
 } LsPage;
 
@@ -104,9 +105,9 @@ typedef struct {
 static const LsPage P25_PAGES[] = {PG_VFO, PG_SIGNAL, PG_CALL, PG_MEM, PG_DIAG};
 static const LsPage FM_PAGES[] = {PG_VFO, PG_SIGNAL, PG_FM_SCAN, PG_MEM, PG_DIAG};
 
-static const LsPage POC_PAGES[] = {PG_POC, PG_POC_LOG, PG_MEM, PG_SIGNAL, PG_DIAG};
+static const LsPage POC_PAGES[] = {PG_POC, PG_VFO, PG_POC_LOG, PG_MEM, PG_SIGNAL, PG_DIAG};
 static const LsPage ADSB_PAGES[] = {PG_TRAFFIC, PG_AIRCRAFT, PG_ADSB_STAT, PG_DIAG};
-static const LsPage REC_PAGES[] = {PG_REC, PG_REC_CAP, PG_MEM, PG_DIAG};
+static const LsPage REC_PAGES[] = {PG_REC, PG_REC_SIG, PG_REC_CAP, PG_MEM, PG_DIAG};
 
 static const LsAppDef APPS[LsRadioCount] = {
     {"P25", "p25", "MODE p25", P25_PAGES, (int)(sizeof(P25_PAGES) / sizeof(LsPage))},
@@ -142,6 +143,7 @@ typedef struct {
     uint8_t bps[HIST_N];
     uint8_t fill[HIST_N];
     uint8_t voice[HIST_N];
+    uint8_t mag[HIST_N];
     uint16_t head;
     uint16_t count;
 } LsHistory;
@@ -181,6 +183,10 @@ typedef enum {
     ECHO_EQ_LOUD,
     ECHO_REC_THRESH,
     ECHO_REC_GAP,
+    ECHO_REC_BW,
+    ECHO_REC_MINP,
+    ECHO_REC_MAXSPAN,
+    ECHO_REC_MINEDGES,
     ECHO_COUNT,
 } LsEchoId;
 
@@ -364,6 +370,7 @@ static void hist_push(LsApp* app) {
     h->bps[h->head] = pct_of((int32_t)t->iq_bytes_sec, 491520);
     h->fill[h->head] = pct_of(t->ring_fill, t->ring_size);
     h->voice[h->head] = t->voice_active ? 2 : (t->has_sync ? 1 : 0);
+    h->mag[h->head] = pct_of(t->rec_mag, 254);
 
     h->head = (h->head + 1) % HIST_N;
     if(h->count < HIST_N) h->count++;
@@ -408,6 +415,7 @@ static const LsMem ADSB_PRESETS[] = {
 
 static const LsMem REC_PRESETS[] = {
     {"OOK 433.92", 433920000},
+    {"FSK 432.80", 432800000},
     {"OOK 315.00", 315000000},
     {"OOK 345.00", 345000000},
     {"OOK 390.00", 390000000},
@@ -1518,6 +1526,10 @@ typedef enum {
     REC_ROW_GAIN,
     REC_ROW_THRESH,
     REC_ROW_GAP,
+    REC_ROW_BW,
+    REC_ROW_MINP,
+    REC_ROW_MAXSPAN,
+    REC_ROW_MINEDGES,
     REC_ROW_COUNT,
 } LsRecRow;
 
@@ -1554,18 +1566,93 @@ static void rec_row_value(LsApp* app, int row, char* out, size_t len) {
         snprintf(out, len, "%ld ms", (long)gp);
         break;
     }
+    case REC_ROW_BW: {
+        int32_t bw = echo_get(app, ECHO_REC_BW, (int32_t)(t->rec_bw_hz / 1000));
+        if(bw <= 0) {
+            snprintf(out, len, "auto");
+        } else {
+            snprintf(out, len, "%ld kHz", (long)bw);
+        }
+        break;
+    }
+    case REC_ROW_MINP: {
+        int32_t mp = echo_get(app, ECHO_REC_MINP, (int32_t)t->rec_min_pulse_us);
+        snprintf(out, len, "%ld us", (long)mp);
+        break;
+    }
+    case REC_ROW_MAXSPAN: {
+        int32_t ms = echo_get(app, ECHO_REC_MAXSPAN, (int32_t)(t->rec_max_span_us / 1000));
+        snprintf(out, len, "%ld ms", (long)ms);
+        break;
+    }
+    case REC_ROW_MINEDGES: {
+        int32_t me = echo_get(app, ECHO_REC_MINEDGES, t->rec_min_edges);
+        snprintf(out, len, "%ld", (long)me);
+        break;
+    }
     default:
         out[0] = '\0';
         break;
     }
 }
 
+static const char* const REC_END_NAMES[] = {"-", "gap", "span cap", "edge cap"};
+
+static void draw_rec_sig(Canvas* c, LsApp* app) {
+    LsTelemetry* t = &app->tel;
+    canvas_set_font(c, FontSecondary);
+
+    const int w = canvas_width(c);
+    const int y0 = body_top();
+    const int hgt = 28;
+
+    draw_trace(c, &app->hist, app->hist.mag, 0, y0, w, hgt, true);
+
+    if(t->rec_thresh > 0) {
+        int pct = clampi((int)t->rec_thresh * 100 / 254, 0, 100);
+        int ty = y0 + hgt - 2 - ((hgt - 2) * pct) / 100;
+        for(int x = 1; x < w - 1; x += 3) canvas_draw_dot(c, x, ty);
+    }
+
+    char v[36];
+    snprintf(
+        v,
+        sizeof(v),
+        "mag %ld  fl %ld  th %ld",
+        (long)t->rec_mag,
+        (long)t->rec_floor,
+        (long)t->rec_thresh);
+    canvas_draw_str(c, 0, y0 + hgt + 9, v);
+
+    if(t->rec_edges > 0) {
+        snprintf(
+            v,
+            sizeof(v),
+            "%s %lu-%lu us ~%lub",
+            REC_END_NAMES[clampi((int)t->rec_end_reason, 0, 3)],
+            (unsigned long)t->rec_min_mark_us,
+            (unsigned long)t->rec_max_mark_us,
+            (unsigned long)t->rec_baud_est);
+    } else {
+        snprintf(v, sizeof(v), "%s", app->link_up ? "waiting for a burst" : "no link");
+    }
+    draw_status_line(c, v);
+}
+
 static void draw_rec(Canvas* c, LsApp* app) {
     LsTelemetry* t = &app->tel;
     canvas_set_font(c, FontSecondary);
 
-    static const char* const LABELS[REC_ROW_COUNT] =
-        {"Record", "Freq", "Gain", "Thresh", "Gap"};
+    static const char* const LABELS[REC_ROW_COUNT] = {
+        "Record",
+        "Freq",
+        "Gain",
+        "Thresh",
+        "Gap",
+        "Bandwidth",
+        "Min pulse",
+        "Max span",
+        "Min edges"};
 
     const int rows = (body_bottom(c) - body_top()) / LS_ROW_H;
     ls_ui_scroll(&app->list_top, app->focus, REC_ROW_COUNT, rows);
@@ -2202,6 +2289,8 @@ static const char* page_title(LsApp* app) {
         return "STATS";
     case PG_REC:
         return "RECORD";
+    case PG_REC_SIG:
+        return "SIGNAL";
     case PG_REC_CAP:
         return "CAPTURE";
     }
@@ -2245,6 +2334,9 @@ static void draw_app_page(Canvas* c, LsApp* app) {
         break;
     case PG_REC:
         draw_rec(c, app);
+        break;
+    case PG_REC_SIG:
+        draw_rec_sig(c, app);
         break;
     case PG_REC_CAP:
         draw_rec_cap(c, app);
@@ -2498,6 +2590,35 @@ static void rec_adjust(LsApp* app, int row, int dir) {
         int v = clampi(cur + step * dir, 2, 2000);
         ls_link_send(app->link, "REC GAP %d", v);
         echo_set(app, ECHO_REC_GAP, v);
+        break;
+    }
+    case REC_ROW_BW: {
+        int cur = (int)echo_get(app, ECHO_REC_BW, (int32_t)(t->rec_bw_hz / 1000));
+        int v = clampi(cur + 50 * dir, 0, 2000);
+        ls_link_send(app->link, "REC BW %d", v * 1000);
+        echo_set(app, ECHO_REC_BW, v);
+        break;
+    }
+    case REC_ROW_MINP: {
+        int cur = (int)echo_get(app, ECHO_REC_MINP, (int32_t)t->rec_min_pulse_us);
+        int step = cur >= 100 ? 20 : 4;
+        int v = clampi(cur + step * dir, 4, 10000);
+        ls_link_send(app->link, "REC MINP %d", v);
+        echo_set(app, ECHO_REC_MINP, v);
+        break;
+    }
+    case REC_ROW_MAXSPAN: {
+        int cur = (int)echo_get(app, ECHO_REC_MAXSPAN, (int32_t)(t->rec_max_span_us / 1000));
+        int v = clampi(cur + 500 * dir, 10, 30000);
+        ls_link_send(app->link, "REC MAXSPAN %d", v * 1000);
+        echo_set(app, ECHO_REC_MAXSPAN, v);
+        break;
+    }
+    case REC_ROW_MINEDGES: {
+        int cur = (int)echo_get(app, ECHO_REC_MINEDGES, t->rec_min_edges);
+        int v = clampi(cur + dir, 2, 64);
+        ls_link_send(app->link, "REC MINEDGES %d", v);
+        echo_set(app, ECHO_REC_MINEDGES, v);
         break;
     }
     default:
@@ -2922,7 +3043,21 @@ static void handle_app(LsApp* app, InputEvent* ev, bool press) {
                 ls_link_send(app->link, "GAIN AUTO");
                 echo_set(app, ECHO_GAIN, 0);
                 toast(app, "Gain -> auto");
+            } else if(app->focus == REC_ROW_BW) {
+                ls_link_send(app->link, "REC BW 0");
+                echo_set(app, ECHO_REC_BW, 0);
+                toast(app, "Bandwidth auto");
             }
+        }
+        break;
+
+    case PG_REC_SIG:
+        if(up) ls_link_send(app->link, "TUNE %ld", (long)STEPS[app->cfg.step_idx]);
+        if(down) ls_link_send(app->link, "TUNE -%ld", (long)STEPS[app->cfg.step_idx]);
+        if(ok) rec_toggle_arm(app);
+        if(ok_long) {
+            memset(&app->hist, 0, sizeof(app->hist));
+            toast(app, "Trace cleared");
         }
         break;
 

@@ -268,6 +268,22 @@ static void apply_kv(LsTelemetry* t, char* tok) {
         t->rec_gap_ms = atoi(v);
     else if((v = kv(tok, "rcp")))
         t->rec_captures = (uint32_t)strtoul(v, NULL, 10);
+    else if((v = kv(tok, "rbw")))
+        t->rec_bw_hz = (uint32_t)strtoul(v, NULL, 10);
+    else if((v = kv(tok, "rmp")))
+        t->rec_min_pulse_us = (uint32_t)strtoul(v, NULL, 10);
+    else if((v = kv(tok, "rms")))
+        t->rec_max_span_us = (uint32_t)strtoul(v, NULL, 10);
+    else if((v = kv(tok, "rme")))
+        t->rec_min_edges = atoi(v);
+    else if((v = kv(tok, "ren")))
+        t->rec_end_reason = atoi(v);
+    else if((v = kv(tok, "rmn")))
+        t->rec_min_mark_us = (uint32_t)strtoul(v, NULL, 10);
+    else if((v = kv(tok, "rmx")))
+        t->rec_max_mark_us = (uint32_t)strtoul(v, NULL, 10);
+    else if((v = kv(tok, "rbd")))
+        t->rec_baud_est = (uint32_t)strtoul(v, NULL, 10);
     else if((v = kv(tok, "rlf")))
         copy_field(t->rec_last_file, sizeof(t->rec_last_file), v);
 
