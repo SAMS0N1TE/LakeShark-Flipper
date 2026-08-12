@@ -752,11 +752,7 @@ void ls_link_send(LsLink* link, const char* fmt, ...) {
         if(link->ble_profile) {
 
             bool ok = ls_ble_profile_tx(link->ble_profile, (const uint8_t*)buf, (uint16_t)n);
-            if(!ok) {
-                furi_delay_ms(10);
-                ok = ls_ble_profile_tx(link->ble_profile, (const uint8_t*)buf, (uint16_t)n);
-            }
-            if(!ok) FURI_LOG_W(TAG, "ble tx dropped (%d B)", n);
+            if(!ok) FURI_LOG_W(TAG, "ble tx reported failure (%d B)", n);
         }
         return;
     }
