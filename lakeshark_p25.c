@@ -1684,6 +1684,9 @@ static void draw_launcher(Canvas* c, LsApp* app) {
                 case LsRadioAdsb:
                     live = (app->tel.mode == LsModeAdsb);
                     break;
+                case LsRadioRec:
+                    live = (app->tel.mode == LsModeRec);
+                    break;
                 default:
                     break;
                 }
