@@ -137,7 +137,7 @@ typedef struct {
     uint32_t rec_captures;
     uint32_t rec_bw_hz;
     uint32_t rec_min_pulse_us;
-    uint32_t rec_max_span_us;
+    uint32_t rec_max_span_ms;
     int32_t rec_min_edges;
     int32_t rec_end_reason;
     uint32_t rec_min_mark_us;

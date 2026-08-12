@@ -1581,7 +1581,7 @@ static void rec_row_value(LsApp* app, int row, char* out, size_t len) {
         break;
     }
     case REC_ROW_MAXSPAN: {
-        int32_t ms = echo_get(app, ECHO_REC_MAXSPAN, (int32_t)(t->rec_max_span_us / 1000));
+        int32_t ms = echo_get(app, ECHO_REC_MAXSPAN, (int32_t)t->rec_max_span_ms);
         snprintf(out, len, "%ld ms", (long)ms);
         break;
     }
@@ -2608,9 +2608,9 @@ static void rec_adjust(LsApp* app, int row, int dir) {
         break;
     }
     case REC_ROW_MAXSPAN: {
-        int cur = (int)echo_get(app, ECHO_REC_MAXSPAN, (int32_t)(t->rec_max_span_us / 1000));
+        int cur = (int)echo_get(app, ECHO_REC_MAXSPAN, (int32_t)t->rec_max_span_ms);
         int v = clampi(cur + 500 * dir, 10, 30000);
-        ls_link_send(app->link, "REC MAXSPAN %d", v * 1000);
+        ls_link_send(app->link, "REC MAXSPAN %d", v);
         echo_set(app, ECHO_REC_MAXSPAN, v);
         break;
     }

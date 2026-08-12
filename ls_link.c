@@ -273,7 +273,7 @@ static void apply_kv(LsTelemetry* t, char* tok) {
     else if((v = kv(tok, "rmp")))
         t->rec_min_pulse_us = (uint32_t)strtoul(v, NULL, 10);
     else if((v = kv(tok, "rms")))
-        t->rec_max_span_us = (uint32_t)strtoul(v, NULL, 10);
+        t->rec_max_span_ms = (uint32_t)strtoul(v, NULL, 10);
     else if((v = kv(tok, "rme")))
         t->rec_min_edges = atoi(v);
     else if((v = kv(tok, "ren")))
