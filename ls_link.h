@@ -31,7 +31,7 @@ typedef enum {
 
 #define LS_REC_MAX_EDGES 4096
 #define LS_REC_CHUNK 32
-/*LS-033*/
+/*LS-526*/
 #define LS_REC_NAME_MAX 28
 
 typedef enum {
@@ -204,7 +204,7 @@ bool ls_link_rec_take(LsLink* link, uint32_t* offset, int* count, int32_t* out, 
 
 void ls_link_rec_reset(LsLink* link);
 
-/*LS-033*/
+/*LS-526*/
 bool ls_link_rec_file_take(
     LsLink* link,
     int* index,

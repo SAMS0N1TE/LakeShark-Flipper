@@ -45,7 +45,7 @@ struct LsLink {
     int rec_count;
     bool rec_pending;
 
-    /*LS-033*/
+    /*LS-526*/
     int rec_file_index;
     int rec_file_total;
     uint32_t rec_file_freq;
@@ -418,7 +418,7 @@ static void parse_eq_line(LsLink* link, char* line) {
     furi_mutex_release(link->lock);
 }
 
-/*LS-033*/
+/*LS-526*/
 /* %S <index> <total> <freq_hz> <bytes> <name>  - one saved capture per reply.
    The board enumerates its directory one entry per round trip (LS-032) rather
    than trying to fit every name in one 384 B line, so this parser handles a
@@ -541,7 +541,7 @@ void ls_link_rec_reset(LsLink* link) {
 
 static void handle_line(LsLink* link, char* line) {
     if(line[0] == '%') {
-        /*LS-033*/
+        /*LS-526*/
         if(line[1] == 'S')
             parse_rec_file(link, line + 1);
         else

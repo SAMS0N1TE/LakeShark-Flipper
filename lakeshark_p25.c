@@ -6,7 +6,7 @@
 #include <storage/storage.h>
 #include <toolbox/stream/file_stream.h>
 #include <furi_hal_bt.h>
-/*LS-033*/
+/*LS-526*/
 #include <loader/loader.h>
 
 #include <stddef.h>
@@ -94,7 +94,7 @@ typedef enum {
     PG_REC,
     PG_REC_SIG,
     PG_REC_CAP,
-    /*LS-033*/
+    /*LS-526*/
     PG_REC_FILES,
 } LsPage;
 
@@ -111,7 +111,7 @@ static const LsPage FM_PAGES[] = {PG_VFO, PG_SIGNAL, PG_FM_SCAN, PG_MEM, PG_DIAG
 
 static const LsPage POC_PAGES[] = {PG_POC, PG_VFO, PG_POC_LOG, PG_MEM, PG_SIGNAL, PG_DIAG};
 static const LsPage ADSB_PAGES[] = {PG_TRAFFIC, PG_AIRCRAFT, PG_ADSB_STAT, PG_DIAG};
-/*LS-033*/
+/*LS-526*/
 static const LsPage REC_PAGES[] = {
     PG_REC, PG_REC_SIG, PG_REC_CAP, PG_REC_FILES, PG_MEM, PG_DIAG};
 
@@ -196,7 +196,7 @@ typedef enum {
     ECHO_COUNT,
 } LsEchoId;
 
-/*LS-033*/
+/*LS-526*/
 #define REC_FILES_MAX 32
 
 typedef struct {
@@ -271,7 +271,7 @@ typedef struct {
     uint32_t rec_freq_hz;
     int rec_xfer;
 
-    /*LS-033*/
+    /*LS-526*/
     RecFileEntry rec_files[REC_FILES_MAX];
     int rec_files_n;
     int rec_files_total;
@@ -650,7 +650,7 @@ static void rec_preview_clear(LsApp* app) {
     app->rec_file[0] = '\0';
 }
 
-/*LS-033*/
+/*LS-526*/
 /* THE OLD NAME WAS LS_<khz>_<nnn>.sub AND EVERY FILE LOOKED THE SAME. Once the
    board grew names of its own (LS-032), carrying one across is free and is the
    difference between picking a capture and guessing at a list of siblings.
@@ -715,7 +715,7 @@ static bool rec_write_sub(LsApp* app, const char* src_name, char* name_out, size
     stream_free(stream);
     furi_record_close(RECORD_STORAGE);
 
-    /*LS-033*/
+    /*LS-526*/
     if(ok) {
         snprintf(app->rec_open_path, sizeof(app->rec_open_path), "%s", path);
     }
@@ -733,7 +733,7 @@ static bool rec_write_sub(LsApp* app, const char* src_name, char* name_out, size
     return ok;
 }
 
-/*LS-033*/
+/*LS-526*/
 static void rec_xfer_start(LsApp* app);
 
 /* Browsing the board's saved set. The board answers one entry per request
@@ -919,7 +919,7 @@ static void rec_xfer_finish(LsApp* app) {
     modal_clear(app);
 
     char name[40];
-    /*LS-033*/
+    /*LS-526*/
     const char* src = NULL;
     if(app->rec_from_files && app->rec_files_sel >= 0 &&
        app->rec_files_sel < app->rec_files_n) {
@@ -2457,7 +2457,7 @@ static uint32_t edit_value(LsApp* app) {
 }
 
 
-/*LS-033*/
+/*LS-526*/
 static void draw_rec_files(Canvas* c, LsApp* app) {
     if(app->rec_files_busy && app->rec_files_n == 0) {
         ls_ui_empty(c, "Reading board...", "");
@@ -2512,7 +2512,7 @@ static const char* page_title(LsApp* app) {
         return "SIGNAL";
     case PG_REC_CAP:
         return "CAPTURE";
-    /*LS-033*/
+    /*LS-526*/
     case PG_REC_FILES:
         return "FILES";
     }
@@ -2563,7 +2563,7 @@ static void draw_app_page(Canvas* c, LsApp* app) {
     case PG_REC_CAP:
         draw_rec_cap(c, app);
         break;
-    /*LS-033*/
+    /*LS-526*/
     case PG_REC_FILES:
         draw_rec_files(c, app);
         break;
@@ -3294,7 +3294,7 @@ static void handle_app(LsApp* app, InputEvent* ev, bool press) {
             toast(app, "Preview cleared");
         }
         break;
-    /*LS-033*/
+    /*LS-526*/
     case PG_REC_FILES:
         if(ok) {
             if(app->rec_files_n <= 0)
@@ -3487,7 +3487,7 @@ int32_t lakeshark_p25_app(void* p) {
     memset(app, 0, sizeof(LsApp));
     app->running = true;
     app->screen = LsScreenLauncher;
-    /*LS-033*/
+    /*LS-526*/
     app->rec_load_idx = -1;
     app->rec_files_sel = 0;
     app->pending_transport = -1;
@@ -3580,7 +3580,7 @@ int32_t lakeshark_p25_app(void* p) {
         if(app->have_tel) poc_ingest(app);
 
         rec_xfer_tick(app);
-        /*LS-033*/
+        /*LS-526*/
         rec_files_tick(app);
         rec_files_load_tick(app);
 
