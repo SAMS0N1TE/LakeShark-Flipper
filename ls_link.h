@@ -31,6 +31,8 @@ typedef enum {
 
 #define LS_REC_MAX_EDGES 4096
 #define LS_REC_CHUNK 32
+/*LS-033*/
+#define LS_REC_NAME_MAX 28
 
 typedef enum {
     LsFmListen,
@@ -201,6 +203,16 @@ void ls_link_send(LsLink* link, const char* fmt, ...);
 bool ls_link_rec_take(LsLink* link, uint32_t* offset, int* count, int32_t* out, int max);
 
 void ls_link_rec_reset(LsLink* link);
+
+/*LS-033*/
+bool ls_link_rec_file_take(
+    LsLink* link,
+    int* index,
+    int* total,
+    uint32_t* freq_hz,
+    long* size,
+    char* name,
+    size_t name_len);
 
 void ls_link_toggle_port(LsLink* link);
 

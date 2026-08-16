@@ -6,6 +6,8 @@
 #include <storage/storage.h>
 #include <toolbox/stream/file_stream.h>
 #include <furi_hal_bt.h>
+/*LS-033*/
+#include <loader/loader.h>
 
 #include <stddef.h>
 #include <stdio.h>
@@ -92,6 +94,8 @@ typedef enum {
     PG_REC,
     PG_REC_SIG,
     PG_REC_CAP,
+    /*LS-033*/
+    PG_REC_FILES,
 } LsPage;
 
 typedef struct {
@@ -107,7 +111,9 @@ static const LsPage FM_PAGES[] = {PG_VFO, PG_SIGNAL, PG_FM_SCAN, PG_MEM, PG_DIAG
 
 static const LsPage POC_PAGES[] = {PG_POC, PG_VFO, PG_POC_LOG, PG_MEM, PG_SIGNAL, PG_DIAG};
 static const LsPage ADSB_PAGES[] = {PG_TRAFFIC, PG_AIRCRAFT, PG_ADSB_STAT, PG_DIAG};
-static const LsPage REC_PAGES[] = {PG_REC, PG_REC_SIG, PG_REC_CAP, PG_MEM, PG_DIAG};
+/*LS-033*/
+static const LsPage REC_PAGES[] = {
+    PG_REC, PG_REC_SIG, PG_REC_CAP, PG_REC_FILES, PG_MEM, PG_DIAG};
 
 static const LsAppDef APPS[LsRadioCount] = {
     {"P25", "p25", "MODE p25", P25_PAGES, (int)(sizeof(P25_PAGES) / sizeof(LsPage))},
@@ -190,6 +196,15 @@ typedef enum {
     ECHO_COUNT,
 } LsEchoId;
 
+/*LS-033*/
+#define REC_FILES_MAX 32
+
+typedef struct {
+    char name[LS_REC_NAME_MAX];
+    uint32_t freq_hz;
+    long size;
+} RecFileEntry;
+
 typedef struct {
     Gui* gui;
     ViewPort* vp;
@@ -255,6 +270,21 @@ typedef struct {
     int rec_total;
     uint32_t rec_freq_hz;
     int rec_xfer;
+
+    /*LS-033*/
+    RecFileEntry rec_files[REC_FILES_MAX];
+    int rec_files_n;
+    int rec_files_total;
+    int rec_files_sel;
+    int rec_files_top;
+    int rec_files_want;
+    uint32_t rec_files_deadline;
+    bool rec_files_busy;
+    int rec_files_retries;
+    int rec_load_idx;
+    uint32_t rec_load_deadline;
+    char rec_open_path[96];
+    bool rec_from_files;
     uint32_t rec_deadline;
     int rec_retries;
     int rec_view;
@@ -620,7 +650,13 @@ static void rec_preview_clear(LsApp* app) {
     app->rec_file[0] = '\0';
 }
 
-static bool rec_write_sub(LsApp* app, char* name_out, size_t name_len) {
+/*LS-033*/
+/* THE OLD NAME WAS LS_<khz>_<nnn>.sub AND EVERY FILE LOOKED THE SAME. Once the
+   board grew names of its own (LS-032), carrying one across is free and is the
+   difference between picking a capture and guessing at a list of siblings.
+   src_name is the board's name when this came from the browse page and NULL
+   when it is a live capture, which keeps the old counter for that case. */
+static bool rec_write_sub(LsApp* app, const char* src_name, char* name_out, size_t name_len) {
     Storage* storage = furi_record_open(RECORD_STORAGE);
     storage_common_mkdir(storage, REC_SUB_ROOT);
     storage_common_mkdir(storage, REC_SUB_DIR);
@@ -628,10 +664,24 @@ static bool rec_write_sub(LsApp* app, char* name_out, size_t name_len) {
     char path[96];
     unsigned long khz = (unsigned long)(app->rec_freq_hz / 1000);
     FileInfo info;
-    int idx = 1;
-    for(; idx < 1000; idx++) {
-        snprintf(path, sizeof(path), REC_SUB_DIR "/LS_%lu_%03d.sub", khz, idx);
-        if(storage_common_stat(storage, path, &info) != FSE_OK) break;
+
+    if(src_name && src_name[0]) {
+        /* <name>_<khz>.sub, and only add a counter if that already exists, so
+           the common case is the name the user typed on the board. */
+        snprintf(path, sizeof(path), REC_SUB_DIR "/%s_%lu.sub", src_name, khz);
+        if(storage_common_stat(storage, path, &info) == FSE_OK) {
+            for(int idx = 2; idx < 1000; idx++) {
+                snprintf(
+                    path, sizeof(path), REC_SUB_DIR "/%s_%lu_%d.sub", src_name, khz, idx);
+                if(storage_common_stat(storage, path, &info) != FSE_OK) break;
+            }
+        }
+    } else {
+        int idx = 1;
+        for(; idx < 1000; idx++) {
+            snprintf(path, sizeof(path), REC_SUB_DIR "/LS_%lu_%03d.sub", khz, idx);
+            if(storage_common_stat(storage, path, &info) != FSE_OK) break;
+        }
     }
 
     bool ok = false;
@@ -665,6 +715,11 @@ static bool rec_write_sub(LsApp* app, char* name_out, size_t name_len) {
     stream_free(stream);
     furi_record_close(RECORD_STORAGE);
 
+    /*LS-033*/
+    if(ok) {
+        snprintf(app->rec_open_path, sizeof(app->rec_open_path), "%s", path);
+    }
+
     if(ok && name_out && name_len) {
         const char* base = strrchr(path, '/');
         if(!base) base = path;
@@ -676,6 +731,136 @@ static bool rec_write_sub(LsApp* app, char* name_out, size_t name_len) {
         name_out[n] = '\0';
     }
     return ok;
+}
+
+/*LS-033*/
+static void rec_xfer_start(LsApp* app);
+
+/* Browsing the board's saved set. The board answers one entry per request
+   (LS-032), so this is a small pump: ask for index N, take the row, ask for
+   N+1, stop at total. A timeout just re-asks the same index - the reply is
+   idempotent, so a late duplicate costs nothing. */
+#define REC_FILES_TIMEOUT_MS 800
+
+static void rec_files_request(LsApp* app, int index) {
+    app->rec_files_want = index;
+    ls_link_send(app->link, "REC LS %d", index);
+    app->rec_files_deadline = furi_get_tick() + furi_ms_to_ticks(REC_FILES_TIMEOUT_MS);
+}
+
+static void rec_files_refresh(LsApp* app) {
+    if(!app->link_up) {
+        toast(app, "No radio");
+        return;
+    }
+    app->rec_files_n = 0;
+    app->rec_files_total = 0;
+    app->rec_files_retries = 0;
+    app->rec_files_busy = true;
+    rec_files_request(app, 0);
+}
+
+static void rec_files_tick(LsApp* app) {
+    if(!app->rec_files_busy) return;
+
+    int index = 0, total = 0;
+    uint32_t freq = 0;
+    long size = 0;
+    char name[LS_REC_NAME_MAX];
+
+    if(ls_link_rec_file_take(app->link, &index, &total, &freq, &size, name, sizeof(name))) {
+        app->rec_files_total = total;
+
+        if(total <= 0 || name[0] == '\0') {
+            app->rec_files_busy = false;
+            return;
+        }
+        if(index == app->rec_files_want && app->rec_files_n < REC_FILES_MAX) {
+            RecFileEntry* e = &app->rec_files[app->rec_files_n++];
+            strncpy(e->name, name, sizeof(e->name) - 1);
+            e->name[sizeof(e->name) - 1] = '\0';
+            e->freq_hz = freq;
+            e->size = size;
+        }
+        app->rec_files_retries = 0;
+        if(app->rec_files_n < total && app->rec_files_n < REC_FILES_MAX) {
+            rec_files_request(app, app->rec_files_n);
+        } else {
+            app->rec_files_busy = false;
+            if(app->rec_files_sel >= app->rec_files_n) app->rec_files_sel = app->rec_files_n - 1;
+            if(app->rec_files_sel < 0) app->rec_files_sel = 0;
+        }
+        return;
+    }
+
+    if(furi_get_tick() > app->rec_files_deadline) {
+        /* Per-request retries, reset on every row that lands. A function-static
+           counter would carry a partial failure into the next refresh and trip
+           the limit early on a link that had already recovered. */
+        if(++app->rec_files_retries > 4) {
+            app->rec_files_busy = false;
+            toast(app, "List timed out");
+            return;
+        }
+        rec_files_request(app, app->rec_files_want);
+    }
+}
+
+/* Selecting a row asks the board to recall that capture into its live edge
+   buffer; the EXISTING %D transfer then ships it. The board's reply is a
+   status line, so rather than parse it here we wait for telemetry to show a
+   finished capture with edges and start the transfer off that. */
+#define REC_LOAD_TIMEOUT_MS 2500
+
+static void rec_files_load_selected(LsApp* app) {
+    if(!app->link_up) {
+        toast(app, "No radio");
+        return;
+    }
+    if(app->rec_files_n <= 0) {
+        toast(app, "Nothing saved");
+        return;
+    }
+    if(app->rec_xfer != RecXferIdle) return;
+
+    app->rec_load_idx = app->rec_files_sel;
+    app->rec_load_deadline = furi_get_tick() + furi_ms_to_ticks(REC_LOAD_TIMEOUT_MS);
+    ls_link_send(app->link, "REC LOAD %d", app->rec_files_sel);
+    toast(app, "Loading...");
+}
+
+static void rec_files_load_tick(LsApp* app) {
+    if(app->rec_load_idx < 0) return;
+
+    if(app->tel.rec_phase == LsRecDone && app->tel.rec_edges > 0) {
+        app->rec_load_idx = -1;
+        app->rec_from_files = true;
+        rec_xfer_start(app);
+        return;
+    }
+    if(furi_get_tick() > app->rec_load_deadline) {
+        app->rec_load_idx = -1;
+        toast(app, "Load failed");
+    }
+}
+
+/* Hand the freshly written .sub straight to the stock Sub-GHz app. A running
+   app cannot start another - loader_start returns LoaderStatusErrorAppStarted -
+   so the launch is ENQUEUED and fires when this app exits, and we exit
+   immediately. That turns "Saved > lakeshark > guess which of the identical
+   ones" into one button. */
+static void rec_open_in_subghz(LsApp* app) {
+    if(app->rec_open_path[0] == '\0') {
+        toast(app, "Nothing saved yet");
+        return;
+    }
+    Loader* loader = furi_record_open(RECORD_LOADER);
+    /* "subghz" is the appid; some builds register the display name instead, so
+       fall back rather than silently doing nothing. */
+    loader_enqueue_launch(loader, "subghz", app->rec_open_path, LoaderDeferredLaunchFlagGui);
+    furi_record_close(RECORD_LOADER);
+
+    app->running = false;
 }
 
 static void rec_xfer_request(LsApp* app) {
@@ -734,9 +919,17 @@ static void rec_xfer_finish(LsApp* app) {
     modal_clear(app);
 
     char name[40];
-    if(app->rec_have > 0 && rec_write_sub(app, name, sizeof(name))) {
+    /*LS-033*/
+    const char* src = NULL;
+    if(app->rec_from_files && app->rec_files_sel >= 0 &&
+       app->rec_files_sel < app->rec_files_n) {
+        src = app->rec_files[app->rec_files_sel].name;
+    }
+    app->rec_from_files = false;
+
+    if(app->rec_have > 0 && rec_write_sub(app, src, name, sizeof(name))) {
         snprintf(app->rec_file, sizeof(app->rec_file), "%s", name);
-        modal_set(app, "SAVED", name, "subghz/lakeshark", 2500);
+        modal_set(app, "SAVED", name, "OK: open in SubGHz", 3000);
         notification_message(app->notif, &sequence_success);
     } else {
         rec_preview_clear(app);
@@ -2263,6 +2456,32 @@ static uint32_t edit_value(LsApp* app) {
     return (uint32_t)strtoul(app->edit, NULL, 10);
 }
 
+
+/*LS-033*/
+static void draw_rec_files(Canvas* c, LsApp* app) {
+    if(app->rec_files_busy && app->rec_files_n == 0) {
+        ls_ui_empty(c, "Reading board...", "");
+        return;
+    }
+    if(app->rec_files_n <= 0) {
+        ls_ui_empty(c, "No saved captures", "OK to refresh");
+        return;
+    }
+
+    int rows = ls_ui_rows(c);
+    ls_ui_scroll(&app->rec_files_top, app->rec_files_sel, app->rec_files_n, rows);
+
+    int y = body_top();
+    for(int i = app->rec_files_top; i < app->rec_files_n && i < app->rec_files_top + rows;
+        i++) {
+        const RecFileEntry* e = &app->rec_files[i];
+        char mhz[16];
+        ls_ui_mhz(mhz, sizeof(mhz), e->freq_hz);
+        ls_ui_row(c, y, e->name, mhz, i == app->rec_files_sel);
+        y += LS_ROW_H;
+    }
+}
+
 static const char* page_title(LsApp* app) {
     switch(cur_page(app)) {
     case PG_VFO:
@@ -2293,6 +2512,9 @@ static const char* page_title(LsApp* app) {
         return "SIGNAL";
     case PG_REC_CAP:
         return "CAPTURE";
+    /*LS-033*/
+    case PG_REC_FILES:
+        return "FILES";
     }
     return "?";
 }
@@ -2340,6 +2562,10 @@ static void draw_app_page(Canvas* c, LsApp* app) {
         break;
     case PG_REC_CAP:
         draw_rec_cap(c, app);
+        break;
+    /*LS-033*/
+    case PG_REC_FILES:
+        draw_rec_files(c, app);
         break;
     }
 }
@@ -3068,6 +3294,20 @@ static void handle_app(LsApp* app, InputEvent* ev, bool press) {
             toast(app, "Preview cleared");
         }
         break;
+    /*LS-033*/
+    case PG_REC_FILES:
+        if(ok) {
+            if(app->rec_files_n <= 0)
+                rec_files_refresh(app);
+            else
+                rec_files_load_selected(app);
+        }
+        /* Long OK is the shortcut the SubGHz browse was making painful: it
+           hands the last file this app wrote straight to the stock app. */
+        if(ok_long) rec_open_in_subghz(app);
+        if(up && app->rec_files_sel > 0) app->rec_files_sel--;
+        if(down && app->rec_files_sel < app->rec_files_n - 1) app->rec_files_sel++;
+        break;
     }
 
     if(ev->type == InputTypeLong && ev->key == InputKeyBack) {
@@ -3247,6 +3487,9 @@ int32_t lakeshark_p25_app(void* p) {
     memset(app, 0, sizeof(LsApp));
     app->running = true;
     app->screen = LsScreenLauncher;
+    /*LS-033*/
+    app->rec_load_idx = -1;
+    app->rec_files_sel = 0;
     app->pending_transport = -1;
 
     app->lock = furi_mutex_alloc(FuriMutexTypeNormal);
@@ -3337,6 +3580,9 @@ int32_t lakeshark_p25_app(void* p) {
         if(app->have_tel) poc_ingest(app);
 
         rec_xfer_tick(app);
+        /*LS-033*/
+        rec_files_tick(app);
+        rec_files_load_tick(app);
 
         uint32_t frames = 0;
         ls_link_stats(app->link, &frames, NULL, NULL);

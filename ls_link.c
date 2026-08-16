@@ -45,6 +45,14 @@ struct LsLink {
     int rec_count;
     bool rec_pending;
 
+    /*LS-033*/
+    int rec_file_index;
+    int rec_file_total;
+    uint32_t rec_file_freq;
+    long rec_file_size;
+    char rec_file_name[LS_REC_NAME_MAX];
+    bool rec_file_pending;
+
     LsTransport transport;
     Bt* bt;
     FuriHalBleProfileBase* ble_profile;
@@ -410,6 +418,72 @@ static void parse_eq_line(LsLink* link, char* line) {
     furi_mutex_release(link->lock);
 }
 
+/*LS-033*/
+/* %S <index> <total> <freq_hz> <bytes> <name>  - one saved capture per reply.
+   The board enumerates its directory one entry per round trip (LS-032) rather
+   than trying to fit every name in one 384 B line, so this parser handles a
+   single row and the UI walks index 0..total-1. */
+static void parse_rec_file(LsLink* link, char* line) {
+    char* p = line + 1;
+    char* end = NULL;
+
+    long index = strtol(p, &end, 10);
+    if(end == p) return;
+    p = end;
+
+    long total = strtol(p, &end, 10);
+    if(end == p || total < 0) return;
+    p = end;
+
+    unsigned long freq = strtoul(p, &end, 10);
+    if(end == p) return;
+    p = end;
+
+    long size = strtol(p, &end, 10);
+    if(end == p) return;
+    p = end;
+
+    while(*p == ' ') p++;
+
+    furi_mutex_acquire(link->lock, FuriWaitForever);
+    link->rec_file_index = (int)index;
+    link->rec_file_total = (int)total;
+    link->rec_file_freq = (uint32_t)freq;
+    link->rec_file_size = size;
+    strncpy(link->rec_file_name, p, sizeof(link->rec_file_name) - 1);
+    link->rec_file_name[sizeof(link->rec_file_name) - 1] = '\0';
+    /* The board sends "-" for an empty directory; keep it as an empty name so
+       the UI does not draw a row called "-". */
+    if(!strcmp(link->rec_file_name, "-")) link->rec_file_name[0] = '\0';
+    link->rec_file_pending = true;
+    furi_mutex_release(link->lock);
+}
+
+bool ls_link_rec_file_take(
+    LsLink* link,
+    int* index,
+    int* total,
+    uint32_t* freq_hz,
+    long* size,
+    char* name,
+    size_t name_len) {
+    furi_mutex_acquire(link->lock, FuriWaitForever);
+    bool got = link->rec_file_pending;
+    if(got) {
+        link->rec_file_pending = false;
+        if(index) *index = link->rec_file_index;
+        if(total) *total = link->rec_file_total;
+        if(freq_hz) *freq_hz = link->rec_file_freq;
+        if(size) *size = link->rec_file_size;
+        if(name && name_len) {
+            strncpy(name, link->rec_file_name, name_len - 1);
+            name[name_len - 1] = '\0';
+        }
+    }
+    furi_mutex_release(link->lock);
+    return got;
+}
+
 static void parse_rec_chunk(LsLink* link, char* line) {
     if(line[0] != 'D') return;
 
@@ -467,7 +541,11 @@ void ls_link_rec_reset(LsLink* link) {
 
 static void handle_line(LsLink* link, char* line) {
     if(line[0] == '%') {
-        parse_rec_chunk(link, line + 1);
+        /*LS-033*/
+        if(line[1] == 'S')
+            parse_rec_file(link, line + 1);
+        else
+            parse_rec_chunk(link, line + 1);
     } else if(line[0] == '&') {
         parse_eq_line(link, line + 1);
     } else if(line[0] == '$') {
