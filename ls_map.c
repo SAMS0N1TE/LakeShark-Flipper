@@ -390,6 +390,41 @@ void map_tick(LsMapCtx* app) {
         app->need_render = true;
     }
 
+    /*LS-839  Hold tracking: keep the focused aircraft under the crosshair.
+
+       ZeroMesh recentres once, in map_focus_index, and never again - which is
+       right for a Meshtastic node that sits on a hilltop for a week. An
+       aircraft at 250 kt leaves a 20 km view in about two minutes, so focusing
+       one and then watching it walk off the edge is not tracking.
+
+       Follow by node_id, not by index. map_sync_aircraft rebuilds the roster
+       every tick from whatever the link last carried, so an aircraft ageing
+       out or a new one appearing shifts every index after it - and focus_idx
+       would quietly come to mean a different aircraft. Re-resolving the ID
+       here repairs that too.
+
+       Not while panning: if the operator has taken hold of the view, the view
+       is theirs until they let go. */
+    if(m->focus_id && !m->pan_active) {
+        for(uint8_t i = 0; i < app->map_roster.count; i++) {
+            LsMapPoint* p = &app->map_roster.pts[i];
+            if(p->node_id != m->focus_id) continue;
+
+            m->focus_idx = i;
+            if(!p->has_position) break;
+
+            float lat = p->latitude_i / 1e7f;
+            float lon = p->longitude_i / 1e7f;
+            if(lat != m->lat || lon != m->lon) {
+                m->lat = lat;
+                m->lon = lon;
+                m->reload = true;
+                m->dirty = true;
+            }
+            break;
+        }
+    }
+
     if(!m->fb_pixels || (!m->dirty && !m->want_towns)) return;
 
     if(m->want_towns) {
