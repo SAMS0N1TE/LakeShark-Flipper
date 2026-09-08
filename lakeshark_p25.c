@@ -14,6 +14,7 @@
 
 #include "ls_link.h"
 #include "ls_ui.h"
+#include "ls_map.h"   /*LS-836*/
 #include "ls_cfg.h"
 #include "ls_dbg.h"
 
@@ -89,6 +90,7 @@ typedef enum {
     PG_TRAFFIC,
     PG_AIRCRAFT,
     PG_ADSB_STAT,
+    PG_ADSB_MAP,
     PG_REC,
     PG_REC_SIG,
     PG_REC_CAP,
@@ -106,7 +108,7 @@ static const LsPage P25_PAGES[] = {PG_VFO, PG_SIGNAL, PG_CALL, PG_MEM, PG_DIAG};
 static const LsPage FM_PAGES[] = {PG_VFO, PG_SIGNAL, PG_FM_SCAN, PG_MEM, PG_DIAG};
 
 static const LsPage POC_PAGES[] = {PG_POC, PG_VFO, PG_POC_LOG, PG_MEM, PG_SIGNAL, PG_DIAG};
-static const LsPage ADSB_PAGES[] = {PG_TRAFFIC, PG_AIRCRAFT, PG_ADSB_STAT, PG_DIAG};
+static const LsPage ADSB_PAGES[] = {PG_TRAFFIC, PG_AIRCRAFT, PG_ADSB_MAP, PG_ADSB_STAT, PG_DIAG};
 static const LsPage REC_PAGES[] = {PG_REC, PG_REC_SIG, PG_REC_CAP, PG_MEM, PG_DIAG};
 
 static const LsAppDef APPS[LsRadioCount] = {
@@ -241,6 +243,12 @@ typedef struct {
 
     LsPocEntry poc[POC_LOG_MAX];
     int poc_count;
+    /*LS-836  The map keeps its own context rather than reaching into LsApp,
+       so the same renderer can be lifted onto the P4 later without dragging
+       this struct with it. */
+    LsMapCtx map_ctx;
+    bool map_ready;
+
     /*LS-830*/
     bool poc_detail;              /* full-screen view of the focused page */
     uint32_t poc_total;           /* every page seen, including aged-out ones */
@@ -1620,6 +1628,46 @@ static void draw_aircraft(Canvas* c, LsApp* app) {
 
    Build the rows first, then emit as many as fit. One rule for all of them,
    so adding a seventh row later cannot reintroduce this. */
+/*LS-836  Shape the aircraft the link gave us into markers the renderer can
+   draw, once per tick rather than once per frame.
+
+   pos_valid is carried across deliberately: an aircraft the P4 is tracking but
+   has no CPR fix for must not be drawn, and a marker at 0,0 off West Africa is
+   how that mistake looks. The renderer already understands has_position, so
+   the check lives in one place.
+
+   1e-4 to 1e-7 degrees is a factor of a thousand - the wire is coarse because
+   11 m is finer than this screen can show, the renderer is fine because it is
+   shared with Meshtastic, which uses 1e-7 everywhere. */
+static void map_sync_aircraft(LsApp* app) {
+    LsMapRoster* r = &app->map_ctx.map_roster;
+    int n = 0;
+
+    for(int i = 0; i < LS_AC_MAX && n < LS_MAP_MAX_PTS; i++) {
+        const LsAircraft* a = &app->tel.ac[i];
+        if(!a->seen) continue;
+
+        LsMapPoint* p = &r->pts[n++];
+        p->node_id = a->icao;
+        p->latitude_i = a->lat_e4 * 1000;
+        p->longitude_i = a->lon_e4 * 1000;
+        p->has_position = a->pos_valid;
+        p->has_name = a->call[0] != 0 && a->call[0] != '-';
+        snprintf(p->short_name, sizeof(p->short_name), "%s", a->call);
+    }
+    r->count = (uint8_t)n;
+}
+
+static void draw_adsb_map(Canvas* c, LsApp* app) {
+    if(!app->map_ready) {
+        ls_ui_empty(c, "Map unavailable", "no map.pmtiles");
+        return;
+    }
+    map_sync_aircraft(app);
+    map_tick(&app->map_ctx);
+    render_map(c, &app->map_ctx);
+}
+
 static void draw_adsb_stat(Canvas* c, LsApp* app) {
     LsTelemetry* t = &app->tel;
     canvas_set_font(c, FontSecondary);
@@ -2430,6 +2478,8 @@ static const char* page_title(LsApp* app) {
         return "AIRCRAFT";
     case PG_ADSB_STAT:
         return "STATS";
+    case PG_ADSB_MAP:
+        return "MAP";
     case PG_REC:
         return "RECORD";
     case PG_REC_SIG:
@@ -2471,6 +2521,9 @@ static void draw_app_page(Canvas* c, LsApp* app) {
         break;
     case PG_AIRCRAFT:
         draw_aircraft(c, app);
+        break;
+    case PG_ADSB_MAP:
+        draw_adsb_map(c, app);
         break;
     case PG_ADSB_STAT:
         draw_adsb_stat(c, app);
@@ -2973,6 +3026,18 @@ static void handle_app(LsApp* app, InputEvent* ev, bool press) {
         if(handled) return;
     }
 
+    /*LS-836  The map wants the D-pad for panning and zooming, and the page
+       strip wants Left and Right for itself. map_wants_key is the renderer
+       saying which ones it is actually using right now - it releases them when
+       it is not panning, so the page strip still works from the map screen.
+       Placed before the page handlers because whoever is using a key has to be
+       asked before the key is spent. */
+    if(cur_page(app) == PG_ADSB_MAP && app->map_ready &&
+       map_wants_key(&app->map_ctx, ev->key)) {
+        input_map(ev, &app->map_ctx);
+        return;
+    }
+
     if(press && ev->key == InputKeyRight) {
         app->page = (app->page + 1) % d->n_pages;
         app->focus = 0;
@@ -3008,6 +3073,11 @@ static void handle_app(LsApp* app, InputEvent* ev, bool press) {
     const bool ok_long = ev->type == InputTypeLong && ev->key == InputKeyOk;
 
     switch(pg) {
+    /*LS-836  Anything the map did not claim above falls through to nothing;
+       the page strip and Back have already had their say. */
+    case PG_ADSB_MAP:
+        break;
+
     case PG_VFO: {
         uint8_t rows[VFO_ROW_MAX];
         const int nrows = vfo_rows(app, rows);
@@ -3428,6 +3498,14 @@ int32_t lakeshark_p25_app(void* p) {
 
     apply_orientation(app);
 
+    /*LS-836  The map shares the app's mutex; render_map runs on the GUI
+       thread while map_tick may fetch a tile from the SD card. */
+    app->map_ctx.lock = app->lock;
+    app->map_ready = map_alloc(&app->map_ctx);
+    if(!app->map_ready) {
+        FURI_LOG_W("LsApp", "map unavailable - no map.pmtiles on the card");
+    }
+
     app->link = ls_link_alloc(LS_LINK_BAUD_DEFAULT);
     ls_link_send(app->link, "PING");
     ls_link_send(app->link, "TEL %d", app->cfg.tel_hz);
@@ -3613,6 +3691,7 @@ int32_t lakeshark_p25_app(void* p) {
     }
 
     ls_cfg_save(&app->cfg);
+    if(app->map_ready) map_free(&app->map_ctx);
     ls_link_free(app->link);
     rec_preview_clear(app);
 
