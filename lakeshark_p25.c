@@ -3580,13 +3580,10 @@ int32_t lakeshark_p25_app(void* p) {
 
         rec_xfer_tick(app);
 
-        /*LS-837  Tile fetch and marker sync belong on this thread, not in the
-           draw callback. Only while the map is actually showing - there is no
-           reason to read the SD card for a screen nobody is looking at. */
-        if(app->map_ready && cur_page(app) == PG_ADSB_MAP) {
-            map_sync_aircraft(app);
-            map_tick(&app->map_ctx);
-        }
+        /*LS-838  Marker sync only. map_tick is called AFTER the mutex is
+           released - see below. */
+        const bool map_live = app->map_ready && cur_page(app) == PG_ADSB_MAP;
+        if(map_live) map_sync_aircraft(app);
 
         uint32_t frames = 0;
         ls_link_stats(app->link, &frames, NULL, NULL);
@@ -3662,6 +3659,21 @@ int32_t lakeshark_p25_app(void* p) {
         app->prev_sdr_bad = sdr_bad;
 
         furi_mutex_release(app->lock);
+
+        /*LS-838  map_tick OUTSIDE the lock, and this is not a style choice.
+
+           app->lock is FuriMutexTypeNormal, which is not recursive, and
+           map_tick acquires it itself (ls_map.c). Calling it from inside this
+           loop's locked region deadlocked the app against itself: the main
+           thread blocked waiting for a mutex it already held, the GUI thread
+           then blocked in draw_cb waiting for the same one, and the whole app
+           froze the moment the page strip reached the map. The link thread
+           does not need the lock to parse, so telemetry kept arriving in the
+           log the entire time and made it look alive.
+
+           LS-837 moved this out of the draw callback and was right to; it
+           just landed on the wrong side of the mutex. */
+        if(map_live) map_tick(&app->map_ctx);
 
         if(app->pending_transport >= 0) {
             LsTransport want = (LsTransport)app->pending_transport;
