@@ -14,7 +14,9 @@
 
 #include "ls_link.h"
 #include "ls_ui.h"
-#include "ls_map.h"   /*LS-836*/
+#include "ls_map.h"
+#include "ls_notify.h" /*LS-840*/
+#include "ls_rtttl.h"  /*LS-840*/   /*LS-836*/
 #include "ls_cfg.h"
 #include "ls_dbg.h"
 
@@ -125,12 +127,60 @@ typedef enum {
     SET_LINK,
     SET_DEVICE,
     SET_DISPLAY,
+    SET_ALERTS,
     SET_ABOUT,
     SET_COUNT,
 } LsSetPage;
 
+/*LS-840  Rows on the alerts page: what it can do, then what it does it for,
+   then a way to hear the result. The order matters - the output choices are
+   what an operator changes most, and the test belongs at the end where it
+   reads as "try that". */
+typedef enum {
+    ALR_LED,
+    ALR_VIBRO,
+    ALR_TONE,
+    ALR_PAGE,
+    ALR_VOICE,
+    ALR_AIR,
+    ALR_CAP,
+    ALR_LINK,
+    ALR_TEST,
+    ALR_COUNT,
+} LsAlrRow;
+
+static const char* const ALR_LABELS[ALR_COUNT] = {
+    "LED flash",
+    "Vibrate",
+    "Tone",
+    "On page",
+    "On voice",
+    "On aircraft",
+    "On capture",
+    "On link up",
+    "Test alert",
+};
+
+/* One table, so the draw, the toggle and the enable cannot drift apart. */
+static int alr_kind(int row) {
+    switch(row) {
+    case ALR_PAGE:
+        return LsAlertPage;
+    case ALR_VOICE:
+        return LsAlertVoice;
+    case ALR_AIR:
+        return LsAlertAircraft;
+    case ALR_CAP:
+        return LsAlertCapture;
+    case ALR_LINK:
+        return LsAlertLink;
+    default:
+        return -1;
+    }
+}
+
 static const char* const SET_TITLES[SET_COUNT] =
-    {"LEVELS", "AUDIO", "LINK", "DEVICE", "DISPLAY", "ABOUT"};
+    {"LEVELS", "AUDIO", "LINK", "DEVICE", "DISPLAY", "ALERTS", "ABOUT"};
 
 typedef enum {
     LsScreenLauncher,
@@ -248,6 +298,22 @@ typedef struct {
        this struct with it. */
     LsMapCtx map_ctx;
     bool map_ready;
+
+    /*LS-840  Alerts. A receiver you are not looking at has to say when
+       something happened, so the head buzzes, blinks or plays a tone.
+
+       Playback runs on its own thread and nothing else will do. A ringtone is
+       a second or more of furi_delay_ms, and every event that raises an alert
+       is raised from the main loop while it holds app->lock - the same loop
+       that services input, probes the link and drives the map. Playing there
+       would stall all of it, and during a POCSAG flood it would stall it
+       continuously. So ls_alert only releases a semaphore. */
+    LsAlertCtx alerts;
+    FuriThread* alert_thr;
+    FuriSemaphore* alert_sig;
+    bool alert_run;
+    uint32_t alert_next;
+    int alert_prev_ac;
 
     /*LS-830*/
     bool poc_detail;              /* full-screen view of the focused page */
@@ -599,6 +665,68 @@ static void mem_delete(LsApp* app, int idx) {
     toast(app, "Deleted");
 }
 
+/*LS-840  An alert every time anything happens is an alert nobody reads, so
+   two gates sit in front of playback: the per-event switch the operator set,
+   and a floor on how often any alert may fire. The floor is what makes a
+   POCSAG flood survivable - 30 pages a second should feel like a flood, not
+   like 30 alerts.
+
+   Called with app->lock held. Everything here must be non-blocking. */
+#define ALERT_MIN_GAP_MS 1500
+
+static void ls_alert(LsApp* app, LsAlertKind kind) {
+    /* LsAlertKind is unsigned, so the low end cannot be out of range. */
+    if(kind >= LsAlertCount) return;
+    if(!app->alerts.on[kind]) return;
+    if(!app->alerts.led && !app->alerts.vibro && app->alerts.ringtone == RingtoneNone) return;
+
+    uint32_t now = furi_get_tick();
+    if(app->alert_next && now < app->alert_next) return;
+    app->alert_next = now + furi_ms_to_ticks(ALERT_MIN_GAP_MS);
+
+    /* Max count 1: a burst coalesces into one alert instead of queueing a
+       backlog that would still be playing minutes later. A full semaphore
+       returns an error here, which is the intended outcome. */
+    furi_semaphore_release(app->alert_sig);
+}
+
+static int32_t alert_worker(void* ctx) {
+    LsApp* app = ctx;
+    while(app->alert_run) {
+        if(furi_semaphore_acquire(app->alert_sig, furi_ms_to_ticks(200)) != FuriStatusOk)
+            continue;
+        if(!app->alert_run) break;
+
+        /* Reads app->alerts without the lock. The settings page writes the
+           same fields, but each is a single word and the worst case is one
+           alert played with the previous setting - not worth taking the main
+           loop's mutex on a thread that then blocks for a second. */
+        notify_rx_message(&app->alerts);
+    }
+    return 0;
+}
+
+/*LS-840  Config holds plain fields so it need not know about the alert stack;
+   these two carry them across. */
+static void alerts_from_cfg(LsApp* app) {
+    app->alerts.led = app->cfg.alert_led;
+    app->alerts.vibro = app->cfg.alert_vibro;
+    app->alerts.ringtone = (uint16_t)app->cfg.alert_tone;
+    for(int k = 0; k < LsAlertCount; k++)
+        app->alerts.on[k] = (app->cfg.alert_mask & (1u << k)) != 0;
+}
+
+static void alerts_to_cfg(LsApp* app) {
+    app->cfg.alert_led = app->alerts.led;
+    app->cfg.alert_vibro = app->alerts.vibro;
+    app->cfg.alert_tone = (int)app->alerts.ringtone;
+    uint8_t m = 0;
+    for(int k = 0; k < LsAlertCount; k++)
+        if(app->alerts.on[k]) m |= (uint8_t)(1u << k);
+    app->cfg.alert_mask = m;
+    ls_cfg_save(&app->cfg);
+}
+
 static void poc_ingest(LsApp* app) {
     LsTelemetry* t = &app->tel;
     if(!t->pocsag_last_text[0] && !t->pocsag_last_addr) return;
@@ -638,6 +766,10 @@ static void poc_ingest(LsApp* app) {
         if(*slot < 255) (*slot)++;
     }
 
+    /*LS-840  A page is the event this app exists for. The blink is only
+       visible to someone already looking at the screen; the alert is for
+       everyone else. */
+    ls_alert(app, LsAlertPage);
     notification_message(app->notif, &sequence_blink_blue_10);
 }
 
@@ -780,6 +912,7 @@ static void rec_xfer_finish(LsApp* app) {
     if(app->rec_have > 0 && rec_write_sub(app, name, sizeof(name))) {
         snprintf(app->rec_file, sizeof(app->rec_file), "%s", name);
         modal_set(app, "SAVED", name, "subghz/lakeshark", 2500);
+        ls_alert(app, LsAlertCapture); /*LS-840*/
         notification_message(app->notif, &sequence_success);
     } else {
         rec_preview_clear(app);
@@ -2393,6 +2526,39 @@ static void draw_set_display(Canvas* c, LsApp* app) {
     }
 }
 
+/*LS-840  Eight yes/no rows and a tone. Drawn as boxes rather than the word
+   "on" repeated eight times: the state becomes a shape, and the row that
+   differs is findable without reading every line. */
+static void draw_set_alerts(Canvas* c, LsApp* app) {
+    canvas_set_font(c, FontSecondary);
+
+    const int rows = ls_ui_rows(c);
+    ls_ui_scroll(&app->list_top, app->focus, ALR_COUNT, rows);
+
+    int y = body_top();
+    for(int i = app->list_top; i < ALR_COUNT && i < app->list_top + rows; i++) {
+        const bool sel = app->focus == i;
+        const int k = alr_kind(i);
+
+        if(k >= 0) {
+            ls_ui_row_check(c, y, ALR_LABELS[i], app->alerts.on[k], sel);
+        } else if(i == ALR_LED) {
+            ls_ui_row_check(c, y, ALR_LABELS[i], app->alerts.led, sel);
+        } else if(i == ALR_VIBRO) {
+            ls_ui_row_check(c, y, ALR_LABELS[i], app->alerts.vibro, sel);
+        } else if(i == ALR_TONE) {
+            char v[RINGTONE_NAME_MAX];
+            ringtone_label(&app->alerts, app->alerts.ringtone, v, sizeof(v));
+            ls_ui_row_edit(c, y, ALR_LABELS[i], v, sel, app->editing && sel);
+        } else {
+            ls_ui_row(c, y, ALR_LABELS[i], "OK", sel);
+        }
+        y += LS_ROW_H;
+    }
+
+    elements_scrollbar(c, app->focus, ALR_COUNT);
+}
+
 static void draw_set_about(Canvas* c, LsApp* app) {
     canvas_set_font(c, FontSecondary);
 
@@ -2562,6 +2728,9 @@ static void draw_settings_page(Canvas* c, LsApp* app) {
         break;
     case SET_DISPLAY:
         draw_set_display(c, app);
+        break;
+    case SET_ALERTS:
+        draw_set_alerts(c, app);
         break;
     case SET_ABOUT:
         draw_set_about(c, app);
@@ -2908,6 +3077,10 @@ static bool settings_row_is_value(LsApp* app) {
         return app->focus == LNK_TEL;
     case SET_DISPLAY:
         return app->focus >= 0 && app->focus < DSP_COUNT;
+    case SET_ALERTS:
+        /* Only the tone is a value to scroll through; the rest toggle on OK,
+           which is the gesture a checkbox asks for. */
+        return app->focus == ALR_TONE;
     default:
 
         return false;
@@ -2933,6 +3106,16 @@ static void settings_adjust(LsApp* app, int dir) {
             app->cfg.tel_hz = hz;
             ls_link_send(app->link, "TEL %d", app->cfg.tel_hz);
             ls_cfg_save(&app->cfg);
+        }
+        break;
+
+    case SET_ALERTS:
+        if(app->focus == ALR_TONE) {
+            int n = (int)ringtone_total(&app->alerts);
+            if(n > 0) {
+                app->alerts.ringtone = (uint16_t)(((int)app->alerts.ringtone + dir + n) % n);
+                alerts_to_cfg(app);
+            }
         }
         break;
 
@@ -3377,6 +3560,10 @@ static void handle_settings(LsApp* app, InputEvent* ev, bool press) {
         if(up) app->focus = (app->focus + DSP_COUNT - 1) % DSP_COUNT;
         if(down) app->focus = (app->focus + 1) % DSP_COUNT;
         break;
+    case SET_ALERTS:
+        if(up) app->focus = (app->focus + ALR_COUNT - 1) % ALR_COUNT;
+        if(down) app->focus = (app->focus + 1) % ALR_COUNT;
+        break;
     case SET_ABOUT:
     default:
         break;
@@ -3405,6 +3592,23 @@ static void handle_settings(LsApp* app, InputEvent* ev, bool press) {
                 break;
             default:
                 break;
+            }
+        } else if(app->set_page == SET_ALERTS) {
+            int k = alr_kind(app->focus);
+            if(k >= 0) {
+                app->alerts.on[k] = !app->alerts.on[k];
+                alerts_to_cfg(app);
+            } else if(app->focus == ALR_LED) {
+                app->alerts.led = !app->alerts.led;
+                alerts_to_cfg(app);
+            } else if(app->focus == ALR_VIBRO) {
+                app->alerts.vibro = !app->alerts.vibro;
+                alerts_to_cfg(app);
+            } else if(app->focus == ALR_TEST) {
+                /*LS-840  Straight to the worker, past both gates: a test the
+                   rate limiter can swallow is a test that teaches nothing. */
+                app->alert_next = 0;
+                furi_semaphore_release(app->alert_sig);
             }
         } else if(app->set_page == SET_DEVICE) {
             device_action(app, app->focus);
@@ -3506,6 +3710,14 @@ int32_t lakeshark_p25_app(void* p) {
 
     /*LS-836  The map shares the app's mutex; render_map runs on the GUI
        thread while map_tick may fetch a tile from the SD card. */
+    /*LS-840  Alerts up before the link is, so a link-up alert can fire. */
+    alerts_from_cfg(app);
+    ringtones_scan(&app->alerts);
+    app->alert_sig = furi_semaphore_alloc(1, 0);
+    app->alert_run = true;
+    app->alert_thr = furi_thread_alloc_ex("LsAlert", 2048, alert_worker, app);
+    furi_thread_start(app->alert_thr);
+
     app->map_ctx.lock = app->lock;
     app->map_ready = map_alloc(&app->map_ctx);
     if(!app->map_ready) {
@@ -3574,9 +3786,21 @@ int32_t lakeshark_p25_app(void* p) {
         bool had = app->have_tel;
         app->have_tel = ls_link_get(app->link, &app->tel);
         app->link_up = ls_link_is_up(app->link);
-        if(!had && app->have_tel) toast(app, "Linked to LakeShark");
+        if(!had && app->have_tel) {
+            toast(app, "Linked to LakeShark");
+            ls_alert(app, LsAlertLink); /*LS-840*/
+        }
 
         if(app->have_tel) poc_ingest(app);
+
+        /*LS-840  Traffic appearing, counted rather than tracked per ICAO: the
+           question an alert can usefully answer here is "is anything up
+           there", not "which one". Off by default - see ls_cfg_defaults. */
+        if(app->have_tel) {
+            int ac_now = adsb_visible(app);
+            if(ac_now > app->alert_prev_ac) ls_alert(app, LsAlertAircraft);
+            app->alert_prev_ac = ac_now;
+        }
 
         rec_xfer_tick(app);
 
@@ -3638,6 +3862,9 @@ int32_t lakeshark_p25_app(void* p) {
 
         bool voice = app->link_up && app->tel.voice_active;
         if(voice && !app->prev_voice) {
+            /*LS-840  Speech starting is the moment worth catching on P25;
+               control traffic never stops, and alerting on it would be noise. */
+            ls_alert(app, LsAlertVoice);
             notification_message(app->notif, &sequence_blink_blue_10);
             if(app->cfg.rx_wake) {
 
@@ -3717,6 +3944,14 @@ int32_t lakeshark_p25_app(void* p) {
     }
 
     ls_cfg_save(&app->cfg);
+    /*LS-840  Stop before the map, and release the semaphore so the worker
+       wakes immediately instead of sitting out its 200 ms timeout. */
+    app->alert_run = false;
+    furi_semaphore_release(app->alert_sig);
+    furi_thread_join(app->alert_thr);
+    furi_thread_free(app->alert_thr);
+    furi_semaphore_free(app->alert_sig);
+
     if(app->map_ready) map_free(&app->map_ctx);
     ls_link_free(app->link);
     rec_preview_clear(app);

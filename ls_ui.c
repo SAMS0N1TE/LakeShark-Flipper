@@ -269,3 +269,28 @@ void ls_ui_age(char* out, size_t len, int32_t age_ms) {
         snprintf(out, len, "%ldh", (long)(age_ms / 3600000));
     }
 }
+
+/*LS-840  A row whose value is a yes/no, drawn as a box instead of the word
+   "on". Alert settings are eight of these in a column; read as text they are a
+   wall of the same two words, and the eye has to parse every line to find the
+   one that is different. As boxes the state is the shape, and the odd one out
+   is visible without reading. Inset far enough to clear a scrollbar. */
+void ls_ui_row_check(Canvas* c, int y, const char* label, bool on, bool selected) {
+    const int w = canvas_width(c);
+    const int box = 7;
+    const int bx = w - 6 - box;
+    const int by = y + (LS_ROW_H - box) / 2;
+
+    if(selected) {
+        canvas_draw_box(c, 0, y, w, LS_ROW_H);
+        canvas_set_color(c, ColorWhite);
+    }
+
+    canvas_set_font(c, FontSecondary);
+    canvas_draw_str(c, 3, y + LS_ROW_H - 3, label);
+
+    canvas_draw_frame(c, bx, by, box, box);
+    if(on) canvas_draw_box(c, bx + 2, by + 2, box - 4, box - 4);
+
+    if(selected) canvas_set_color(c, ColorBlack);
+}
