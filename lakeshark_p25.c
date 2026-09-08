@@ -23,7 +23,7 @@
 /*LS-841  Kept in step with fap_version in application.fam by hand; the
    build does not hand it to us, and a version the ABOUT page invents is
    worse than none. */
-#define LS_HEAD_VERSION "v2.4"   /*LS-836*/
+#define LS_HEAD_VERSION "v2.5"   /*LS-836*/
 #include "ls_cfg.h"
 #include "ls_dbg.h"
 
