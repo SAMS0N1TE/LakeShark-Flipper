@@ -72,14 +72,17 @@ static void copy_field(char* dst, size_t dst_len, const char* src) {
         if(*p == '_') *p = ' ';
 }
 
+/*LS-832  Ten: the eight an aircraft always has, plus lat and lon. */
+#define AC_FIELD_MAX 10
+
 static void parse_aircraft(LsTelemetry* t, int slot, char* v) {
     if(slot < 0 || slot >= LS_AC_MAX) return;
 
-    char* field[8] = {0};
+    char* field[AC_FIELD_MAX] = {0};
     int n = 0;
     char* p = v;
     field[n++] = p;
-    while(*p && n < 8) {
+    while(*p && n < AC_FIELD_MAX) {
         if(*p == ',') {
             *p++ = '\0';
             field[n++] = p;
@@ -87,6 +90,10 @@ static void parse_aircraft(LsTelemetry* t, int slot, char* v) {
         }
         p++;
     }
+    /*LS-832  Eight fields is a complete aircraft; ten means it also carries a
+       position. Accept both so a head can talk to a radio that predates
+       positions on the wire, and so an aircraft the decoder has not fixed yet
+       is simply shorter rather than special. */
     if(n < 8) return;
 
     LsAircraft* a = &t->ac[slot];
@@ -98,6 +105,17 @@ static void parse_aircraft(LsTelemetry* t, int slot, char* v) {
     a->vert_rate = atoi(field[5]);
     a->age_ms = atoi(field[6]);
     a->msg_count = atoi(field[7]);
+
+    /*LS-832*/
+    if(n >= 10) {
+        a->lat_e4 = atoi(field[8]);
+        a->lon_e4 = atoi(field[9]);
+        a->pos_valid = true;
+    } else {
+        a->lat_e4 = 0;
+        a->lon_e4 = 0;
+        a->pos_valid = false;
+    }
     a->seen = true;
 }
 
@@ -617,8 +635,20 @@ LsLinkState ls_link_state(LsLink* link) {
 
     if(link->ble_starting) return LsStateBleStarting;
     if(link->ble_failed) return LsStateBleFailed;
+
+    /*LS-834  Believe the frames over the callback.
+
+       This asked ble_connected - a flag set from bt_set_status_changed_callback
+       - before it looked at whether anything was actually arriving. When that
+       callback does not fire, and on this firmware it often does not, the
+       launcher reported "advertising" forever while telemetry was streaming in
+       and every screen behind it was updating. An indicator that contradicts
+       the data path is worse than no indicator.
+
+       Frames arriving IS a connection. Nothing else needs to agree. */
+    if(up) return LsStateBleUp;
     if(!link->ble_connected) return LsStateBleAdvertising;
-    return up ? LsStateBleUp : LsStateBleConnected;
+    return LsStateBleConnected;
 }
 
 const char* ls_link_state_str(LsLink* link) {

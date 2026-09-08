@@ -153,7 +153,17 @@ typedef struct {
     uint32_t freq_hz;
 } LsMem;
 
-#define POC_LOG_MAX 16
+/*LS-830  16 was a keepsake, not a log. POCSAG arrives in floods - a paging
+   hub pushes dozens in a few seconds - and 16 entries scroll away before you
+   can look up. 48 costs about 4.6 KB and holds a minute of a busy channel
+   rather than ten seconds. */
+#define POC_LOG_MAX 48
+
+/*LS-830  Seconds of page-rate history behind the flood tape. 64 columns is
+   also 64 pixels, half the Flipper's width, so the tape draws one pixel per
+   second with no scaling and no arithmetic to get wrong. */
+#define POC_TAPE_N 64
+#define POC_STRIP_H 10
 
 #define POC_TEXT_MAX 80
 typedef struct {
@@ -231,6 +241,11 @@ typedef struct {
 
     LsPocEntry poc[POC_LOG_MAX];
     int poc_count;
+    /*LS-830*/
+    bool poc_detail;              /* full-screen view of the focused page */
+    uint32_t poc_total;           /* every page seen, including aged-out ones */
+    uint8_t poc_rate[POC_TAPE_N]; /* pages per second, ring indexed by second */
+    uint32_t poc_sec;             /* second poc_rate was last advanced to */
     uint32_t poc_last_addr;
     char poc_last_text[POC_TEXT_MAX];
 
@@ -595,6 +610,26 @@ static void poc_ingest(LsApp* app) {
     e->tick = furi_get_tick();
     if(app->poc_count < POC_LOG_MAX) app->poc_count++;
 
+    /*LS-830  Count it in the tape whether or not the log kept it. The log is
+       what a page SAID; the tape is how many ARRIVED, and during a flood those
+       are very different numbers - which is exactly the thing the tape exists
+       to answer. */
+    app->poc_total++;
+    {
+        uint32_t sec = furi_get_tick() / 1000u;
+        if(sec != app->poc_sec) {
+            /* Zero the seconds that passed with nothing in them, so a quiet
+               gap reads as a gap instead of leaving stale bars standing. */
+            uint32_t gap = sec - app->poc_sec;
+            if(gap > POC_TAPE_N) gap = POC_TAPE_N;
+            for(uint32_t g = 1; g <= gap; g++)
+                app->poc_rate[(app->poc_sec + g) % POC_TAPE_N] = 0;
+            app->poc_sec = sec;
+        }
+        uint8_t* slot = &app->poc_rate[sec % POC_TAPE_N];
+        if(*slot < 255) (*slot)++;
+    }
+
     notification_message(app->notif, &sequence_blink_blue_10);
 }
 
@@ -832,6 +867,25 @@ static int body_bottom(Canvas* c) {
 }
 static int body_full(Canvas* c) {
     return canvas_height(c);
+}
+
+/*LS-831  One rule for whether a stat row fits, instead of per-site guards.
+
+   draw_call and draw_adsb_stat each drew their first four rows unconditionally
+   and only guarded the rest. On the Flipper the canvas is 128x64, so
+   body_bottom is 53 and LS_ROW_H is 11: rows land at 14, 25, 36 and 47, and
+   the fourth occupies 47..57 - straight through the status-line divider at 54
+   and its text below. "BCH ok/fail" and "Preambles" were printed on top of the
+   status line.
+
+   A guard that has to be remembered at every call site is a guard that will be
+   forgotten at the next one. Returns false when the row did not fit, so a
+   caller can stop building rows it cannot show. */
+static bool stat_row(Canvas* c, int* y, const char* label, const char* value) {
+    if(*y + LS_ROW_H > body_bottom(c)) return false;
+    ls_ui_row(c, *y, label, value, false);
+    *y += LS_ROW_H;
+    return true;
 }
 
 static void draw_focus_str(
@@ -1132,8 +1186,7 @@ static void draw_call(Canvas* c, LsApp* app) {
     } else {
         snprintf(v, sizeof(v), "---");
     }
-    ls_ui_row(c, y, "NAC", v, false);
-    y += LS_ROW_H;
+    stat_row(c, &y, "NAC", v);
 
     if(t->tg_age_ms >= 0) {
         ls_ui_age(age, sizeof(age), t->tg_age_ms);
@@ -1141,8 +1194,7 @@ static void draw_call(Canvas* c, LsApp* app) {
     } else {
         snprintf(v, sizeof(v), "---");
     }
-    ls_ui_row(c, y, "TG", v, false);
-    y += LS_ROW_H;
+    stat_row(c, &y, "TG", v);
 
     if(t->src_age_ms >= 0) {
         ls_ui_age(age, sizeof(age), t->src_age_ms);
@@ -1150,32 +1202,25 @@ static void draw_call(Canvas* c, LsApp* app) {
     } else {
         snprintf(v, sizeof(v), "---");
     }
-    ls_ui_row(c, y, "SRC", v, false);
-    y += LS_ROW_H;
+    stat_row(c, &y, "SRC", v);
 
     snprintf(v, sizeof(v), "%ld/%ld", (long)t->bch_ok, (long)t->bch_fail);
-    ls_ui_row(c, y, "BCH ok/fail", v, false);
-    y += LS_ROW_H;
+    stat_row(c, &y, "BCH ok/fail", v);
 
-    if(y + LS_ROW_H <= body_bottom(c)) {
-
+    {
         const char* dmn = t->demod_name[0] ? t->demod_name :
                           (t->demod_mode >= 0 && t->demod_mode < 4) ?
                                               DEMOD_NAMES[t->demod_mode] :
                                               "-";
         snprintf(v, sizeof(v), "%s %s", dmn, t->polarity_inverted ? "INV" : "NRM");
-        ls_ui_row(c, y, "Demod", v, false);
-        y += LS_ROW_H;
+        stat_row(c, &y, "Demod", v);
     }
-    if(y + LS_ROW_H <= body_bottom(c)) {
-        snprintf(v, sizeof(v), "%s", t->ftype[0] ? t->ftype : "-");
-        ls_ui_row(c, y, "Frame", v, false);
-        y += LS_ROW_H;
-    }
-    if(y + LS_ROW_H <= body_bottom(c)) {
-        snprintf(v, sizeof(v), "%ld/%ld", (long)t->sync_count, (long)t->voice_count);
-        ls_ui_row(c, y, "Sync/Voice", v, false);
-    }
+
+    snprintf(v, sizeof(v), "%s", t->ftype[0] ? t->ftype : "-");
+    stat_row(c, &y, "Frame", v);
+
+    snprintf(v, sizeof(v), "%ld/%ld", (long)t->sync_count, (long)t->voice_count);
+    stat_row(c, &y, "Sync/Voice", v);
 
     draw_status_line(c, t->err);
 }
@@ -1347,24 +1392,105 @@ static void draw_poc(Canvas* c, LsApp* app) {
     }
 }
 
+/*LS-830  The flood tape: one pixel column per second, newest on the right.
+
+   The complaint was that pages arrive far too fast to notice - a list of the
+   last few tells you what was said and nothing about how much is coming. This
+   is a seismograph. A quiet channel is a flat line; a burst is a spike you
+   catch out of the corner of your eye without reading a word. It costs 64
+   bytes and about fifteen lines. */
+static void draw_poc_tape(Canvas* c, LsApp* app, int x, int y, int h) {
+    uint32_t now = furi_get_tick() / 1000u;
+
+    /* The tallest column in view sets the scale, so a quiet channel still
+       shows its shape instead of a row of single pixels. A floor of 2 stops
+       one page a second from filling the strip. */
+    uint8_t peak = 2;
+    for(int i = 0; i < POC_TAPE_N; i++)
+        if(app->poc_rate[i] > peak) peak = app->poc_rate[i];
+
+    for(int col = 0; col < POC_TAPE_N; col++) {
+        /* col 0 is the oldest second on screen, POC_TAPE_N-1 is this one. */
+        uint32_t sec = now - (uint32_t)(POC_TAPE_N - 1 - col);
+        uint8_t n = app->poc_rate[sec % POC_TAPE_N];
+        if(!n) continue;
+        int bar = (n * h) / peak;
+        if(bar < 1) bar = 1;
+        if(bar > h) bar = h;
+        canvas_draw_line(c, x + col, y + h - bar, x + col, y + h);
+    }
+    /* Baseline, so an idle channel reads as "listening" rather than as a
+       blank area somebody forgot to draw. */
+    canvas_draw_line(c, x, y + h, x + POC_TAPE_N - 1, y + h);
+}
+
+/*LS-830  One page, full screen. The log line gives a message 80 pixels and
+   canvas_draw_str does not wrap or clip, so anything long simply ran off the
+   right edge and was unreadable. This wraps it. */
+static void draw_poc_detail(Canvas* c, LsApp* app) {
+    if(app->focus < 0 || app->focus >= app->poc_count) {
+        app->poc_detail = false;
+        return;
+    }
+    LsPocEntry* e = &app->poc[app->focus];
+    const int w = canvas_width(c);
+
+    canvas_set_font(c, FontPrimary);
+    char head[32];
+    snprintf(head, sizeof(head), "%lu%s%s", (unsigned long)e->addr,
+             e->type[0] ? " " : "", e->type);
+    canvas_draw_str(c, 3, body_top() + 8, head);
+
+    canvas_set_font(c, FontSecondary);
+    char meta[32], age[16];
+    ls_ui_age(age, sizeof(age), (int32_t)(furi_get_tick() - e->tick));
+    snprintf(meta, sizeof(meta), "%d bd %s", e->baud, age);
+    canvas_draw_str_aligned(c, w - 3, body_top() + 8, AlignRight, AlignBottom, meta);
+    canvas_draw_line(c, 0, body_top() + 11, w - 1, body_top() + 11);
+
+    elements_text_box(c, 3, body_top() + 14, w - 6,
+                      body_full(c) - body_top() - 14, AlignLeft, AlignTop,
+                      e->text[0] ? e->text : "(no text)", false);
+}
+
 static void draw_poc_log(Canvas* c, LsApp* app) {
     canvas_set_font(c, FontSecondary);
 
+    if(app->poc_detail) {
+        draw_poc_detail(c, app);
+        return;
+    }
+
+    const int w = canvas_width(c);
+
+    /*LS-830  Status strip: how many have arrived, and the shape of the last
+       minute. Drawn whether or not anything is logged - on an empty log the
+       tape is the difference between "quiet channel" and "receiver is not
+       working", which the word "listening..." cannot tell you. */
+    {
+        char tot[24];
+        snprintf(tot, sizeof(tot), "%lu pages", (unsigned long)app->poc_total);
+        canvas_draw_str(c, 3, body_top() + 7, tot);
+        draw_poc_tape(c, app, w - POC_TAPE_N - 2, body_top(), POC_STRIP_H - 2);
+    }
+
+    const int top = body_top() + POC_STRIP_H;
+
     if(app->poc_count == 0) {
-        ls_ui_empty(c, "No pages yet", "listening...");
+        canvas_draw_str_aligned(c, w / 2, top + 14, AlignCenter, AlignTop,
+                                "No pages yet");
         return;
     }
 
     const int per = 18;
-    const int rows = (body_full(c) - body_top()) / per;
+    const int rows = (body_full(c) - top) / per;
     ls_ui_scroll(&app->list_top, app->focus, app->poc_count, rows);
 
-    const int w = canvas_width(c);
     for(int r = 0; r < rows; r++) {
         int i = app->list_top + r;
         if(i >= app->poc_count) break;
         LsPocEntry* e = &app->poc[i];
-        int y = body_top() + r * per;
+        int y = top + r * per;
         bool sel = (i == app->focus);
 
         if(sel) {
@@ -1483,39 +1609,56 @@ static void draw_aircraft(Canvas* c, LsApp* app) {
     }
 }
 
+/*LS-831  Every row bounds-checked, not just the last two.
+
+   The first four rows were drawn unconditionally and only rows five and six
+   asked whether they fitted. On the Flipper the canvas is 128x64, so
+   body_bottom is 53 and LS_ROW_H is 11: rows land at 14, 25, 36 and 47, and
+   the fourth occupies 47..57 - straight through the status-line divider at
+   54 and the text baseline below it. "Preambles" and "1090.000 MHz, fixed"
+   were printed on top of each other.
+
+   Build the rows first, then emit as many as fit. One rule for all of them,
+   so adding a seventh row later cannot reintroduce this. */
 static void draw_adsb_stat(Canvas* c, LsApp* app) {
     LsTelemetry* t = &app->tel;
     canvas_set_font(c, FontSecondary);
 
-    char v[24];
+    struct {
+        const char* label;
+        char value[24];
+    } row[6];
+    int n = 0;
+
+    row[n].label = "Tracked";
+    snprintf(row[n].value, sizeof(row[n].value), "%ld", (long)t->ac_tracked);
+    n++;
+
+    row[n].label = "Messages";
+    snprintf(row[n].value, sizeof(row[n].value), "%ld/s", (long)t->msgs_sec);
+    n++;
+
+    row[n].label = "CRC ok/err";
+    snprintf(row[n].value, sizeof(row[n].value), "%ld/%ld", (long)t->crc_good,
+             (long)t->crc_err);
+    n++;
+
+    row[n].label = "Preambles";
+    snprintf(row[n].value, sizeof(row[n].value), "%ld/s", (long)t->bursts_sec);
+    n++;
+
+    row[n].label = "Mag avg/peak";
+    snprintf(row[n].value, sizeof(row[n].value), "%ld/%ld", (long)t->mag_avg,
+             (long)t->mag_peak);
+    n++;
+
+    row[n].label = "Last message";
+    ls_ui_age(row[n].value, sizeof(row[n].value), t->last_msg_ms);
+    n++;
+
     int y = body_top();
-
-    snprintf(v, sizeof(v), "%ld", (long)t->ac_tracked);
-    ls_ui_row(c, y, "Tracked", v, false);
-    y += LS_ROW_H;
-
-    snprintf(v, sizeof(v), "%ld/s", (long)t->msgs_sec);
-    ls_ui_row(c, y, "Messages", v, false);
-    y += LS_ROW_H;
-
-    snprintf(v, sizeof(v), "%ld/%ld", (long)t->crc_good, (long)t->crc_err);
-    ls_ui_row(c, y, "CRC ok/err", v, false);
-    y += LS_ROW_H;
-
-    snprintf(v, sizeof(v), "%ld/s", (long)t->bursts_sec);
-    ls_ui_row(c, y, "Preambles", v, false);
-    y += LS_ROW_H;
-
-    if(y + LS_ROW_H <= body_bottom(c)) {
-        snprintf(v, sizeof(v), "%ld/%ld", (long)t->mag_avg, (long)t->mag_peak);
-        ls_ui_row(c, y, "Mag avg/peak", v, false);
-        y += LS_ROW_H;
-    }
-    if(y + LS_ROW_H <= body_bottom(c)) {
-        char age[8];
-        ls_ui_age(age, sizeof(age), t->last_msg_ms);
-        ls_ui_row(c, y, "Last message", age, false);
-    }
+    for(int i = 0; i < n; i++)
+        if(!stat_row(c, &y, row[i].label, row[i].value)) break;
 
     draw_status_line(c, "1090.000 MHz, fixed");
 }
@@ -2844,6 +2987,13 @@ static void handle_app(LsApp* app, InputEvent* ev, bool press) {
         app->editing = false;
         return;
     }
+    /*LS-830  Back closes the page detail before it leaves the app. Without
+       this, opening a page and pressing Back drops the operator all the way
+       out to the launcher, which is not what Back means anywhere else. */
+    if(ev->type == InputTypeShort && ev->key == InputKeyBack && app->poc_detail) {
+        app->poc_detail = false;
+        return;
+    }
     if(ev->type == InputTypeShort && ev->key == InputKeyBack) {
         app->screen = LsScreenLauncher;
         app->focus = (int)app->app;
@@ -2988,11 +3138,19 @@ static void handle_app(LsApp* app, InputEvent* ev, bool press) {
         break;
 
     case PG_POC_LOG:
+        /*LS-830  In the detail view the only thing the D-pad should do is
+           walk to the next page, so a flood can be read one at a time without
+           bouncing back to the list for each one. */
         if(up && app->poc_count) app->focus = (app->focus + app->poc_count - 1) % app->poc_count;
         if(down && app->poc_count) app->focus = (app->focus + 1) % app->poc_count;
+        if(ok && app->poc_count && !app->poc_detail) {
+            app->poc_detail = true;
+            break;
+        }
         if(ok_long) {
             app->poc_count = 0;
             app->focus = 0;
+            app->poc_detail = false;
             app->poc_last_addr = 0;
             app->poc_last_text[0] = '\0';
             toast(app, "Log cleared");

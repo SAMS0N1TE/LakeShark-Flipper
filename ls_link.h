@@ -52,6 +52,15 @@ typedef struct {
     int32_t age_ms;
     int32_t msg_count;
     bool seen;
+    /*LS-832  Position, in 1e-4 degrees, when the P4's CPR decode has one.
+
+       CPR needs a matched even/odd frame pair, so an aircraft is tracked -
+       callsign, altitude, velocity - for a while before it has any position.
+       pos_valid is what separates "at 0,0" from "not yet known", and a map
+       that ignores it puts every silent aircraft off the coast of Africa. */
+    int32_t lat_e4;
+    int32_t lon_e4;
+    bool pos_valid;
 } LsAircraft;
 
 typedef struct {
