@@ -83,6 +83,16 @@ static void edit_wrap(char* out, size_t len, const char* value) {
     snprintf(out, len, "<%s>", value ? value : "");
 }
 
+/*LS-845  Values stop short of the right edge, not at it.
+
+   elements_scrollbar draws in the last three columns, and every list page
+   that shows a value also scrolls - so a value right-aligned to the edge had
+   its last character sitting under the scrollbar. It went unnoticed while
+   values were short; "3000ft 220kt" on the traffic list made it obvious the
+   first time the screen was actually photographed. Pages with no scrollbar
+   just gain three pixels of margin. */
+#define LS_VALUE_RIGHT 6
+
 void ls_ui_row_edit(
     Canvas* c,
     int y,
@@ -104,10 +114,10 @@ void ls_ui_row_edit(
     }
 
     int base = y + LS_ROW_H - 3;
-    int avail = w - 6;
+    int avail = w - 3 - LS_VALUE_RIGHT;
 
     if(value && value[0]) {
-        canvas_draw_str_aligned(c, w - 3, base, AlignRight, AlignBottom, value);
+        canvas_draw_str_aligned(c, w - LS_VALUE_RIGHT, base, AlignRight, AlignBottom, value);
         avail -= canvas_string_width(c, value) + 4;
     }
 
@@ -176,7 +186,7 @@ void ls_ui_level_edit(
     canvas_draw_str(c, 3, base, label);
 
     int vw = value && value[0] ? canvas_string_width(c, value) : 0;
-    if(vw) canvas_draw_str_aligned(c, w - 3, base, AlignRight, AlignBottom, value);
+    if(vw) canvas_draw_str_aligned(c, w - LS_VALUE_RIGHT, base, AlignRight, AlignBottom, value);
 
     int lw = canvas_string_width(c, label);
     int bx = 3 + lw + 4;
@@ -298,7 +308,7 @@ void ls_ui_row_icon(
 
     canvas_set_font(c, FontSecondary);
     if(value && value[0]) {
-        canvas_draw_str_aligned(c, w - 3, base, AlignRight, AlignBottom, value);
+        canvas_draw_str_aligned(c, w - LS_VALUE_RIGHT, base, AlignRight, AlignBottom, value);
     }
     canvas_draw_str(c, 13, base, label);
 
