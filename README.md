@@ -3,6 +3,18 @@
 
 This is LakeShark Flipper Edition, which is basically a control head for the LakeShark SDR receiver on a Waveshare ESP32-P4-NANO. The radio does receiving and decoding and the Flipper acts as a remote control. It supports connections over the GPIO pins and Bluetooth.
 
+## Screenshots
+
+| Launcher | P25 |
+| --- | --- |
+| ![Orange Flipper launcher](docs/screenshots/launcher.png) | ![P25 receiver](docs/screenshots/p25_vfo.png) |
+| **ADS-B traffic** | **ADS-B map** |
+| ![ADS-B traffic](docs/screenshots/adsb_traffic.png) | ![ADS-B map](docs/screenshots/adsb_map.png) |
+| **POCSAG** | **Alerts** |
+| ![POCSAG receiver](docs/screenshots/pocsag.png) | ![Alert settings](docs/screenshots/set_alerts.png) |
+
+**[User guide: every page, button controls and setup](docs/wiki/Home.md)**
+
 ## What it do
 
 I've added four receivers and all of them are a work in progress. I will try to rate them below for your expectations. I will continue to refine these and will update this table. 
