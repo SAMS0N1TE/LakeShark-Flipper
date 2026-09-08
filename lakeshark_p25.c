@@ -2102,6 +2102,27 @@ static void draw_rec_cap(Canvas* c, LsApp* app) {
     }
 }
 
+/*LS-844  Launcher icons: 8x8 XBM, least-significant bit leftmost, generated
+   from ASCII grids so the shapes could be judged as shapes before they were
+   ever on a screen. A speaker for voice, a tower for broadcast, an envelope
+   for messages, an aircraft, the record dot, a gear. */
+static const uint8_t ICON_P25[] = {0x0C, 0x4E, 0xAF, 0xAF, 0xAF, 0x4E, 0x0C, 0x00};
+static const uint8_t ICON_FM[] = {0x18, 0x18, 0x3C, 0x24, 0x66, 0x42, 0xC3, 0x81};
+static const uint8_t ICON_POCSAG[] = {0x00, 0x7E, 0x42, 0x66, 0x5A, 0x42, 0x7E, 0x00};
+static const uint8_t ICON_ADSB[] = {0x08, 0x08, 0x08, 0x7F, 0x08, 0x08, 0x1C, 0x00};
+static const uint8_t ICON_REC[] = {0x00, 0x3C, 0x7E, 0x7E, 0x7E, 0x7E, 0x3C, 0x00};
+static const uint8_t ICON_SET[] = {0x24, 0x7E, 0x66, 0xC3, 0xC3, 0x66, 0x7E, 0x24};
+
+/* Indexed by LsRadioApp, so a new app that forgets its icon is a compile
+   error rather than a blank column. */
+static const uint8_t* const APP_ICONS[LsRadioCount] = {
+    ICON_P25,
+    ICON_FM,
+    ICON_POCSAG,
+    ICON_ADSB,
+    ICON_REC,
+};
+
 static void draw_launcher(Canvas* c, LsApp* app) {
     canvas_set_font(c, FontSecondary);
 
@@ -2145,7 +2166,13 @@ static void draw_launcher(Canvas* c, LsApp* app) {
             label = "Settings";
             value = ls_link_state_str(app->link);
         }
-        ls_ui_row(c, body_top() + r * LS_ROW_H, label, value, i == app->focus);
+        ls_ui_row_icon(
+            c,
+            body_top() + r * LS_ROW_H,
+            i < LsRadioCount ? APP_ICONS[i] : ICON_SET,
+            label,
+            value,
+            i == app->focus);
     }
     elements_scrollbar(c, app->focus, n);
 }

@@ -32,6 +32,14 @@ void ls_ui_divider_row(Canvas* c, int y, const char* label);
 
 void ls_ui_row_check(Canvas* c, int y, const char* label, bool on, bool selected);
 
+void ls_ui_row_icon(
+    Canvas* c,
+    int y,
+    const uint8_t* icon,
+    const char* label,
+    const char* value,
+    bool selected);
+
 int ls_ui_rows(Canvas* c);
 
 void ls_ui_scroll(int* top, int sel, int count, int rows);

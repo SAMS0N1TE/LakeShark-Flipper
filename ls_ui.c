@@ -270,6 +270,41 @@ void ls_ui_age(char* out, size_t len, int32_t age_ms) {
     }
 }
 
+/*LS-844  A list row with a glyph in front of the label.
+
+   The launcher was six rows of the same shape, told apart only by reading
+   them. An icon column turns "which one is ADS-B" into something the eye
+   answers before the words are read - which matters most on the screen you
+   see every time the app opens.
+
+   canvas_draw_xbm honours the current colour, so the selected row inverts
+   the icon along with everything else and needs no special case. */
+void ls_ui_row_icon(
+    Canvas* c,
+    int y,
+    const uint8_t* icon,
+    const char* label,
+    const char* value,
+    bool selected) {
+    const int w = canvas_width(c);
+
+    if(selected) {
+        canvas_draw_box(c, 0, y, w, LS_ROW_H);
+        canvas_set_color(c, ColorWhite);
+    }
+
+    const int base = y + LS_ROW_H - 3;
+    if(icon) canvas_draw_xbm(c, 2, y + (LS_ROW_H - 8) / 2, 8, 8, icon);
+
+    canvas_set_font(c, FontSecondary);
+    if(value && value[0]) {
+        canvas_draw_str_aligned(c, w - 3, base, AlignRight, AlignBottom, value);
+    }
+    canvas_draw_str(c, 13, base, label);
+
+    if(selected) canvas_set_color(c, ColorBlack);
+}
+
 /*LS-840  A row whose value is a yes/no, drawn as a box instead of the word
    "on". Alert settings are eight of these in a column; read as text they are a
    wall of the same two words, and the eye has to parse every line to find the
