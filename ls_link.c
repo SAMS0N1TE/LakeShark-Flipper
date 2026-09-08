@@ -40,6 +40,15 @@ struct LsLink {
     char last_reply[64];
     uint32_t last_reply_tick;
 
+    /*LS-841  The radio's own version string, kept apart from last_reply.
+
+       last_reply is whatever came back most recently, and the probe timer
+       overwrites it with a pong within a second or two - fine for a status
+       line, useless for "what firmware is the radio running". The VER reply
+       identifies itself, so it is captured wherever it appears rather than
+       being matched to a request. */
+    char radio_ver[96];
+
     int32_t rec_chunk[LS_REC_CHUNK];
     uint32_t rec_offset;
     int rec_count;
@@ -494,6 +503,18 @@ static void handle_line(LsLink* link, char* line) {
         parse_telemetry(link, line + 1);
     } else if(line[0] == '+' || line[0] == '-') {
         furi_mutex_acquire(link->lock, FuriWaitForever);
+        /*LS-841  "+OK LakeShark_1.0.1-g8cc5b7be_board_..." - self-identifying,
+           so no request tracking is needed and an older radio that never sends
+           it simply leaves the field empty.
+
+           The separator is an underscore, not a space: the wire protocol is
+           space-delimited and the radio runs the version through sanitize()
+           before sending it. Accept either, because that is a property of the
+           transport rather than of the version string. */
+        if(!strncmp(line, "+OK LakeShark", 13) && (line[13] == '_' || line[13] == ' ')) {
+            strncpy(link->radio_ver, line + 4, sizeof(link->radio_ver) - 1);
+            link->radio_ver[sizeof(link->radio_ver) - 1] = '\0';
+        }
         strncpy(link->last_reply, line, sizeof(link->last_reply) - 1);
         link->last_reply[sizeof(link->last_reply) - 1] = '\0';
         link->last_reply_tick = furi_get_tick();
@@ -848,6 +869,14 @@ void ls_link_stats(LsLink* link, uint32_t* frames, uint32_t* replies, uint32_t* 
     if(frames) *frames = link->frames;
     if(replies) *replies = link->replies;
     if(bad) *bad = link->bad;
+    furi_mutex_release(link->lock);
+}
+
+void ls_link_radio_version(LsLink* link, char* out, size_t out_len) {
+    if(!out || out_len == 0) return;
+    furi_mutex_acquire(link->lock, FuriWaitForever);
+    strncpy(out, link->radio_ver, out_len - 1);
+    out[out_len - 1] = '\0';
     furi_mutex_release(link->lock);
 }
 

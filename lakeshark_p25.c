@@ -16,7 +16,12 @@
 #include "ls_ui.h"
 #include "ls_map.h"
 #include "ls_notify.h" /*LS-840*/
-#include "ls_rtttl.h"  /*LS-840*/   /*LS-836*/
+#include "ls_rtttl.h"  /*LS-840*/
+
+/*LS-841  Kept in step with fap_version in application.fam by hand; the
+   build does not hand it to us, and a version the ABOUT page invents is
+   worse than none. */
+#define LS_HEAD_VERSION "v2.4"   /*LS-836*/
 #include "ls_cfg.h"
 #include "ls_dbg.h"
 
@@ -348,6 +353,11 @@ typedef struct {
     int rec_retries;
     int rec_view;
     char rec_file[40];
+
+    /*LS-842  What we last told the radio, not what it is - there is no
+       telemetry field for the log level, and asking would cost a round trip
+       for something the operator just set. Starts at the firmware default. */
+    int log_level;
 
     bool prev_voice;
     bool prev_sdr_bad;
@@ -1692,14 +1702,36 @@ static void draw_traffic(Canvas* c, LsApp* app) {
         const LsAircraft* a = adsb_at(app, i);
         if(!a) break;
 
-        char label[20], value[20];
+        char label[20], value[24];
 
         if(a->call[0]) {
             snprintf(label, sizeof(label), "%s", a->call);
         } else {
             snprintf(label, sizeof(label), "%06lX", (unsigned long)a->icao);
         }
-        snprintf(value, sizeof(value), "%ldft", (long)a->altitude);
+
+        /*LS-843  Altitude alone does not say what an aircraft is doing. The
+           P4 already sends vertical rate and ground speed, and a climbing
+           departure and a descending arrival at the same 8000 ft are the
+           difference between "just took off" and "landing in five minutes" -
+           which is the whole question when you are watching a list. 300 fpm
+           is the usual level-flight deadband, below which the arrow would
+           just flicker on noise. */
+        char trend = ' ';
+        if(a->vert_rate > 300) trend = '^';
+        else if(a->vert_rate < -300) trend = 'v';
+
+        if(a->velocity > 0) {
+            snprintf(
+                value,
+                sizeof(value),
+                "%ldft%c %ldkt",
+                (long)a->altitude,
+                trend,
+                (long)a->velocity);
+        } else {
+            snprintf(value, sizeof(value), "%ldft%c", (long)a->altitude, trend);
+        }
         ls_ui_row(c, body_top() + r * LS_ROW_H, label, value, i == app->focus);
     }
     elements_scrollbar(c, app->focus, n);
@@ -2377,11 +2409,17 @@ static void draw_set_link(Canvas* c, LsApp* app) {
     draw_status_line(c, hint);
 }
 
+/*LS-842  The radio's log level, remotely. esp_log's ladder, in its order,
+   so the index is the level. */
+static const char* const LOG_LEVEL_NAMES[] = {"error", "warn", "info", "debug", "verbose"};
+#define LOG_LEVEL_COUNT ((int)(sizeof(LOG_LEVEL_NAMES) / sizeof(LOG_LEVEL_NAMES[0])))
+
 typedef enum {
     DEV_UPTIME,
     DEV_MEM,
     DEV_SDR,
     DEV_SYS,
+    DEV_LOG,
     DEV_TESTSND,
     DEV_SDR_RESET,
     DEV_SDR_RECOVER,
@@ -2441,6 +2479,10 @@ static void draw_set_device(Canvas* c, LsApp* app) {
             break;
         case DEV_SYS:
             label = "Read SYS info";
+            break;
+        case DEV_LOG:
+            label = "Radio log";
+            snprintf(v, sizeof(v), "%s", LOG_LEVEL_NAMES[app->log_level]);
             break;
         case DEV_TESTSND:
             label = "Test sound";
@@ -2559,28 +2601,84 @@ static void draw_set_alerts(Canvas* c, LsApp* app) {
     elements_scrollbar(c, app->focus, ALR_COUNT);
 }
 
-static void draw_set_about(Canvas* c, LsApp* app) {
-    canvas_set_font(c, FontSecondary);
+/*LS-841  What is at the other end of the link.
 
-    char v[24];
+   This page used to answer questions the rest of the app already answers -
+   mode, transport and frame count are on VFO, LINK and DIAG. The question
+   only this page can answer is which firmware the radio is running, and it
+   was the one thing missing: the P4 has always had a VER command and the head
+   never sent it, so an operator with the radio in another room had no way to
+   tell a current build from one six months old.
+
+   Laid out as an identity block rather than a row list, because that is what
+   it is: who this is, then what it is talking to. */
+static void draw_set_about(Canvas* c, LsApp* app) {
+    const int w = canvas_width(c);
     int y = body_top();
 
-    ls_ui_row(c, y, "Radio", app->tel.mode_name[0] ? app->tel.mode_name : "-", false);
-    y += LS_ROW_H;
-    ls_ui_row(c, y, "Transport", ls_link_port_name(app->link), false);
-    y += LS_ROW_H;
-    uint32_t frames = 0;
-    ls_link_stats(app->link, &frames, NULL, NULL);
-    snprintf(v, sizeof(v), "%lu", (unsigned long)frames);
-    ls_ui_row(c, y, "Frames", v, false);
+    canvas_set_font(c, FontPrimary);
+    canvas_draw_str(c, 3, y + 9, "LakeShark");
+    canvas_set_font(c, FontSecondary);
+    canvas_draw_str_aligned(c, w - 3, y + 9, AlignRight, AlignBottom, LS_HEAD_VERSION);
+    y += 11;
+    canvas_draw_line(c, 0, y, w - 1, y);
+    y += 2;
+
+    char ver[96];
+    ls_link_radio_version(app->link, ver, sizeof(ver));
+
+    if(ver[0]) {
+        /* "LakeShark_1.0.1-g8cc5b7beda55-dirty_[DIRTY]_board_ESP32-P4-..._built_..."
+           Board and build time are another sixty characters that will not fit
+           on a row and answer nothing this page is for. Keep the release, keep
+           enough of the hash to find the build again, and keep whether it came
+           from a dirty tree - that last one is the difference between a build
+           you can check out and one that only ever existed on someone's
+           bench. */
+        /* Cut the token out at full length first. Trimming into the display
+           buffer as we go loses the "-dirty" suffix off the end before there
+           is a chance to notice it, and a dirty build that renders as a clean
+           one is the one mistake this row must not make. */
+        char tok[48];
+        size_t n = 0;
+        const char* p = ver + 10; /* past "LakeShark" and its separator */
+        while(p[n] && p[n] != '_' && p[n] != ' ' && n < sizeof(tok) - 1) n++;
+        memcpy(tok, p, n);
+        tok[n] = '\0';
+
+        bool dirty = false;
+        char* tail = strstr(tok, "-dirty");
+        if(tail) {
+            *tail = '\0';
+            dirty = true;
+        }
+        /* Trim the git hash to the eight characters people actually type. */
+        char* g = strstr(tok, "-g");
+        if(g && strlen(g) > 10) g[10] = '\0';
+        if(dirty) strlcat(tok, "*", sizeof(tok));
+
+        char shown[24];
+        strlcpy(shown, tok, sizeof(shown));
+
+        canvas_draw_str(c, 3, y + 8, "Radio fw");
+        canvas_draw_str_aligned(c, w - 3, y + 8, AlignRight, AlignBottom, shown);
+    } else {
+        canvas_draw_str(c, 3, y + 8, "Radio fw");
+        canvas_draw_str_aligned(
+            c, w - 3, y + 8, AlignRight, AlignBottom, app->link_up ? "asking..." : "no link");
+    }
     y += LS_ROW_H;
 
-    snprintf(v, sizeof(v), "%d Hz", app->cfg.tel_hz);
-    ls_ui_row(c, y, "Telemetry", v, false);
+    char v[24];
+    uint32_t frames = 0;
+    ls_link_stats(app->link, &frames, NULL, NULL);
+    snprintf(v, sizeof(v), "%s %lu fr", ls_link_port_name(app->link), (unsigned long)frames);
+    ls_ui_row(c, y, "Link", v, false);
     y += LS_ROW_H;
+
     if(y + LS_ROW_H <= body_full(c)) {
-        snprintf(v, sizeof(v), "%d", app->mem_count);
-        ls_ui_row(c, y, "Memories", v, false);
+        snprintf(v, sizeof(v), "%d Hz / %d mem", app->cfg.tel_hz, app->mem_count);
+        ls_ui_row(c, y, "Telemetry", v, false);
     }
 }
 
@@ -3024,6 +3122,15 @@ static void device_action(LsApp* app, int row) {
     case DEV_SYS:
         ls_link_send(app->link, "SYS");
         toast(app, "SYS requested");
+        break;
+    case DEV_LOG:
+        /*LS-842  Turning the radio's logging up is the first thing you want
+           when it misbehaves, and the whole point of this head is that the
+           radio is not in reach. Cycles on OK rather than opening an editor:
+           five values, and you almost always want the next one up. */
+        app->log_level = (app->log_level + 1) % LOG_LEVEL_COUNT;
+        ls_link_send(app->link, "LOG * %s", LOG_LEVEL_NAMES[app->log_level]);
+        toast(app, "Log %s", LOG_LEVEL_NAMES[app->log_level]);
         break;
     case DEV_TESTSND:
         ls_link_send(app->link, "BEEP NOW");
@@ -3710,6 +3817,12 @@ int32_t lakeshark_p25_app(void* p) {
 
     /*LS-836  The map shares the app's mutex; render_map runs on the GUI
        thread while map_tick may fetch a tile from the SD card. */
+    /*LS-842  Start where the firmware starts. There is no telemetry field
+       for the log level, so this is a belief, not a reading - but a wrong
+       belief that says "info" is far less confusing than one that says
+       "error" while the radio is plainly logging at info. */
+    app->log_level = 2; /* info */
+
     /*LS-840  Alerts up before the link is, so a link-up alert can fire. */
     alerts_from_cfg(app);
     ringtones_scan(&app->alerts);
@@ -3788,6 +3901,10 @@ int32_t lakeshark_p25_app(void* p) {
         app->link_up = ls_link_is_up(app->link);
         if(!had && app->have_tel) {
             toast(app, "Linked to LakeShark");
+            /*LS-841  Ask once per link. A radio that reboots behind our back
+               comes back as a fresh have_tel edge, so the version cannot go
+               stale without being asked again. */
+            ls_link_send(app->link, "VER");
             ls_alert(app, LsAlertLink); /*LS-840*/
         }
 

@@ -201,6 +201,10 @@ bool ls_link_is_up(LsLink* link);
 
 void ls_link_stats(LsLink* link, uint32_t* frames, uint32_t* replies, uint32_t* bad);
 
+/*LS-841  Empty until the radio has answered a VER, and on firmware too old
+   to send one it stays empty - which is itself the answer. */
+void ls_link_radio_version(LsLink* link, char* out, size_t out_len);
+
 void ls_link_last_reply(LsLink* link, char* out, size_t out_len);
 
 uint32_t ls_link_reply_age_ms(LsLink* link);
