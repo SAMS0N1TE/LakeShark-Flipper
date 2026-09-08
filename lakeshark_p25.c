@@ -1663,8 +1663,14 @@ static void draw_adsb_map(Canvas* c, LsApp* app) {
         ls_ui_empty(c, "Map unavailable", "no map.pmtiles");
         return;
     }
-    map_sync_aircraft(app);
-    map_tick(&app->map_ctx);
+    /*LS-837  DRAW ONLY. map_tick reads tiles off the SD card and decodes MVT
+       geometry, and calling it from here put all of that inside the GUI draw
+       callback - which the Flipper answers with
+
+           [W][ViewPort] ViewPort lockup: see .../view_port.c:196
+
+       every couple of seconds. ZeroMesh drives map_tick from its main loop and
+       so do we now. */
     render_map(c, &app->map_ctx);
 }
 
@@ -3573,6 +3579,14 @@ int32_t lakeshark_p25_app(void* p) {
         if(app->have_tel) poc_ingest(app);
 
         rec_xfer_tick(app);
+
+        /*LS-837  Tile fetch and marker sync belong on this thread, not in the
+           draw callback. Only while the map is actually showing - there is no
+           reason to read the SD card for a screen nobody is looking at. */
+        if(app->map_ready && cur_page(app) == PG_ADSB_MAP) {
+            map_sync_aircraft(app);
+            map_tick(&app->map_ctx);
+        }
 
         uint32_t frames = 0;
         ls_link_stats(app->link, &frames, NULL, NULL);
