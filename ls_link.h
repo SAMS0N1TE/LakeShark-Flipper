@@ -1,4 +1,5 @@
 #pragma once
+#include "ls_rec_load_ack.h"
 
 #include <furi.h>
 #include <furi_hal_serial.h>
@@ -232,3 +233,6 @@ void ls_link_toggle_port(LsLink* link);
 const char* ls_link_port_name(LsLink* link);
 
 void ls_link_selftest(LsLink* link);
+
+/* Snapshot the latest correlated REC LOAD reply and its monotonic sequence. */
+uint32_t ls_link_rec_load_reply(LsLink* link, LsRecLoadAck* out);

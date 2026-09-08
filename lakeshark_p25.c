@@ -363,6 +363,7 @@ typedef struct {
     int rec_have;
     int rec_total;
     uint32_t rec_freq_hz;
+    uint32_t rec_expected_span_us;
     int rec_xfer;
 
     /*LS-526*/
@@ -376,6 +377,7 @@ typedef struct {
     bool rec_files_busy;
     int rec_files_retries;
     int rec_load_idx;
+    uint32_t rec_load_seq;
     uint32_t rec_load_deadline;
     char rec_open_path[96];
     bool rec_from_files;
@@ -920,6 +922,7 @@ static bool rec_write_sub(LsApp* app, const char* src_name, char* name_out, size
 
 /*LS-526*/
 static void rec_xfer_start(LsApp* app);
+static void rec_xfer_start_capture(LsApp* app, int total, uint32_t freq_hz, uint32_t expected_span_us);
 
 /* Browsing the board's saved set. The board answers one entry per request
    (LS-032), so this is a small pump: ask for index N, take the row, ask for
@@ -991,10 +994,9 @@ static void rec_files_tick(LsApp* app) {
     }
 }
 
-/* Selecting a row asks the board to recall that capture into its live edge
-   buffer; the EXISTING %D transfer then ships it. The board's reply is a
-   status line, so rather than parse it here we wait for telemetry to show a
-   finished capture with edges and start the transfer off that. */
+/* Wait for the selected file's fresh load acknowledgement. A cached DONE
+   telemetry frame can describe a smaller previous capture and silently cut
+   off the new download, or give it the previous file's frequency. */
 #define REC_LOAD_TIMEOUT_MS 2500
 
 static void rec_files_load_selected(LsApp* app) {
@@ -1008,6 +1010,7 @@ static void rec_files_load_selected(LsApp* app) {
     }
     if(app->rec_xfer != RecXferIdle) return;
 
+    app->rec_load_seq = ls_link_rec_load_reply(app->link, NULL);
     app->rec_load_idx = app->rec_files_sel;
     app->rec_load_deadline = furi_get_tick() + furi_ms_to_ticks(REC_LOAD_TIMEOUT_MS);
     ls_link_send(app->link, "REC LOAD %d", app->rec_files_sel);
@@ -1017,10 +1020,12 @@ static void rec_files_load_selected(LsApp* app) {
 static void rec_files_load_tick(LsApp* app) {
     if(app->rec_load_idx < 0) return;
 
-    if(app->tel.rec_phase == LsRecDone && app->tel.rec_edges > 0) {
+    LsRecLoadAck ack;
+    uint32_t seq = ls_link_rec_load_reply(app->link, &ack);
+    if(ls_rec_load_ack_ready(&ack, seq, app->rec_load_seq, app->rec_load_idx)) {
         app->rec_load_idx = -1;
         app->rec_from_files = true;
-        rec_xfer_start(app);
+        rec_xfer_start_capture(app, ack.edges, ack.freq_hz, ack.span_us);
         return;
     }
     if(furi_get_tick() > app->rec_load_deadline) {
@@ -1054,23 +1059,25 @@ static void rec_xfer_request(LsApp* app) {
 }
 
 static void rec_xfer_start(LsApp* app) {
+    if(app->tel.rec_phase == LsRecCapturing) {
+        toast(app, "Still capturing");
+        return;
+    }
+    rec_xfer_start_capture(app, (int)app->tel.rec_edges, app->tel.freq_hz, 0);
+}
+
+static void rec_xfer_start_capture(LsApp* app, int total, uint32_t freq_hz, uint32_t expected_span_us) {
     if(app->rec_xfer != RecXferIdle) return;
 
     if(!app->link_up) {
         toast(app, "No radio");
         return;
     }
-    if(app->tel.rec_phase == LsRecCapturing) {
-        toast(app, "Still capturing");
-        return;
-    }
-
-    int total = (int)app->tel.rec_edges;
     if(total <= 0) {
         toast(app, "Nothing captured");
         return;
     }
-    if(total > LS_REC_MAX_EDGES) total = LS_REC_MAX_EDGES;
+    if(total > LS_REC_MAX_EDGES) { toast(app, "Capture too large"); return; }
 
     rec_preview_clear(app);
     app->rec_buf = malloc(sizeof(int32_t) * (size_t)total);
@@ -1083,7 +1090,8 @@ static void rec_xfer_start(LsApp* app) {
     app->rec_have = 0;
     app->rec_retries = 0;
     app->rec_view = 0;
-    app->rec_freq_hz = app->tel.freq_hz;
+    app->rec_freq_hz = freq_hz;
+    app->rec_expected_span_us = expected_span_us;
     app->rec_xfer = RecXferActive;
 
     ls_link_rec_reset(app->link);
@@ -1100,6 +1108,17 @@ static void rec_xfer_cancel(LsApp* app, const char* why) {
 }
 
 static void rec_xfer_finish(LsApp* app) {
+    if(app->rec_expected_span_us) {
+        uint64_t span = 0;
+        for(int i = 0; i < app->rec_have; ++i) {
+            int64_t edge = app->rec_buf[i];
+            span += (uint64_t)(edge < 0 ? -edge : edge);
+        }
+        if(span != app->rec_expected_span_us) {
+            rec_xfer_cancel(app, "Capture data changed");
+            return;
+        }
+    }
     app->rec_xfer = RecXferIdle;
     modal_clear(app);
 
@@ -1133,11 +1152,11 @@ static void rec_xfer_tick(LsApp* app) {
     while(ls_link_rec_take(app->link, &off, &count, chunk, LS_REC_CHUNK)) {
         if((int)off != app->rec_have) continue;
 
-        if(count == 0) {
-            rec_xfer_finish(app);
+        if(count == 0 || count > app->rec_total - app->rec_have) {
+            rec_xfer_cancel(app, "Capture size changed");
             return;
         }
-        for(int i = 0; i < count && app->rec_have < app->rec_total; i++) {
+        for(int i = 0; i < count; i++) {
             app->rec_buf[app->rec_have++] = chunk[i];
         }
         app->rec_retries = 0;

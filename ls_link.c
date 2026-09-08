@@ -37,6 +37,9 @@ struct LsLink {
     uint32_t replies;
     uint32_t bad;
 
+    LsRecLoadAck rec_load_ack;
+    uint32_t rec_load_ack_seq;
+
     char last_reply[64];
     uint32_t last_reply_tick;
 
@@ -593,6 +596,11 @@ static void handle_line(LsLink* link, char* line) {
             strncpy(link->radio_ver, line + 4, sizeof(link->radio_ver) - 1);
             link->radio_ver[sizeof(link->radio_ver) - 1] = '\0';
         }
+        LsRecLoadAck ack;
+        if(ls_rec_load_ack_parse(line, &ack)) {
+            link->rec_load_ack = ack;
+            link->rec_load_ack_seq++;
+        }
         strncpy(link->last_reply, line, sizeof(link->last_reply) - 1);
         link->last_reply[sizeof(link->last_reply) - 1] = '\0';
         link->last_reply_tick = furi_get_tick();
@@ -996,4 +1004,12 @@ void ls_link_send(LsLink* link, const char* fmt, ...) {
 
     furi_hal_serial_tx(link->serial, (const uint8_t*)buf, (size_t)n);
     furi_hal_serial_tx_wait_complete(link->serial);
+}
+
+uint32_t ls_link_rec_load_reply(LsLink* link, LsRecLoadAck* out) {
+    furi_mutex_acquire(link->lock, FuriWaitForever);
+    if(out) *out = link->rec_load_ack;
+    uint32_t seq = link->rec_load_ack_seq;
+    furi_mutex_release(link->lock);
+    return seq;
 }
