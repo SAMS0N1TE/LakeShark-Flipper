@@ -18,8 +18,19 @@ typedef enum {
     LsModeP25,
     LsModeFm,
     LsModeAdsb,
+    LsModeRec,
     LsModeUnknown,
 } LsMode;
+
+typedef enum {
+    LsRecIdle,
+    LsRecArmed,
+    LsRecCapturing,
+    LsRecDone,
+} LsRecPhase;
+
+#define LS_REC_MAX_EDGES 4096
+#define LS_REC_CHUNK 32
 
 typedef enum {
     LsFmListen,
@@ -40,6 +51,10 @@ typedef struct {
     int32_t vert_rate;
     int32_t age_ms;
     int32_t msg_count;
+    /**/
+    bool pos_valid;
+    int32_t lat_e4;
+    int32_t lon_e4;
     bool seen;
 } LsAircraft;
 
@@ -62,6 +77,7 @@ typedef struct {
     uint32_t free_dma;
 
     int32_t sdr_stall_s;
+    char rtl_health[12];
 
     int32_t eq_preset;
     int32_t eq_hp_hz;
@@ -115,9 +131,30 @@ typedef struct {
     char pocsag_last_type[4];
     char pocsag_last_text[80];
 
+    int32_t rec_phase;
+    int32_t rec_edges;
+    uint32_t rec_span_us;
+    int32_t rec_mag;
+    int32_t rec_floor;
+    int32_t rec_thresh;
+    int32_t rec_thresh_fixed;
+    int32_t rec_gap_ms;
+    uint32_t rec_captures;
+    uint32_t rec_bw_hz;
+    uint32_t rec_min_pulse_us;
+    uint32_t rec_max_span_ms;
+    int32_t rec_min_edges;
+    int32_t rec_end_reason;
+    uint32_t rec_min_mark_us;
+    uint32_t rec_max_mark_us;
+    uint32_t rec_baud_est;
+    char rec_last_file[24];
+
     int32_t ac_tracked;
     int32_t ac_count;
     int32_t msgs_total;
+    /**/
+    int32_t tts_vol;
     int32_t msgs_sec;
     int32_t crc_good;
     int32_t crc_err;
@@ -167,6 +204,10 @@ void ls_link_last_reply(LsLink* link, char* out, size_t out_len);
 uint32_t ls_link_reply_age_ms(LsLink* link);
 
 void ls_link_send(LsLink* link, const char* fmt, ...);
+
+bool ls_link_rec_take(LsLink* link, uint32_t* offset, int* count, int32_t* out, int max);
+
+void ls_link_rec_reset(LsLink* link);
 
 void ls_link_toggle_port(LsLink* link);
 

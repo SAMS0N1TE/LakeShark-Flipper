@@ -1,7 +1,7 @@
 ![lakeshark_banner](https://github.com/user-attachments/assets/34b12b2c-fd64-4fdc-850c-e9c93d7aede7#gh-light-mode-only)
 ![lakeshark_banner_dark](https://github.com/user-attachments/assets/657f79dc-afd4-4943-89b3-d9b215a7cb09#gh-dark-mode-only)
 
-This is LakeShark Flipper Edition, which is basically a control head for the LakeShark SDR receiver on a Waveshare ESP32-P4-NANO. The radio does receiving and decoding and the Flipper acts as a remote control. It supports connections over the GPIO pins and Bluetooth.
+LakeShark Flipper Edition is a control head for the LakeShark SDR receiver. Use Bluetooth with the LilyGO T-Display-P4, or Bluetooth and supported GPIO connections with the headless ESP32-P4 boards. The receiver handles radio reception and decoding; the Flipper controls receiver selection, tuning, volume and recording transfer.
 
 ## Screenshots
 

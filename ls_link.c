@@ -40,6 +40,11 @@ struct LsLink {
     char last_reply[64];
     uint32_t last_reply_tick;
 
+    int32_t rec_chunk[LS_REC_CHUNK];
+    uint32_t rec_offset;
+    int rec_count;
+    bool rec_pending;
+
     LsTransport transport;
     Bt* bt;
     FuriHalBleProfileBase* ble_profile;
@@ -70,11 +75,12 @@ static void copy_field(char* dst, size_t dst_len, const char* src) {
 static void parse_aircraft(LsTelemetry* t, int slot, char* v) {
     if(slot < 0 || slot >= LS_AC_MAX) return;
 
-    char* field[8] = {0};
+    /**/
+    char* field[11] = {0};
     int n = 0;
     char* p = v;
     field[n++] = p;
-    while(*p && n < 8) {
+    while(*p && n < 11) {
         if(*p == ',') {
             *p++ = '\0';
             field[n++] = p;
@@ -93,6 +99,11 @@ static void parse_aircraft(LsTelemetry* t, int slot, char* v) {
     a->vert_rate = atoi(field[5]);
     a->age_ms = atoi(field[6]);
     a->msg_count = atoi(field[7]);
+
+    a->pos_valid = (n >= 11) && atoi(field[8]) != 0;
+    a->lat_e4 = (n >= 11) ? (int32_t)strtol(field[9], NULL, 10) : 0;
+    a->lon_e4 = (n >= 11) ? (int32_t)strtol(field[10], NULL, 10) : 0;
+
     a->seen = true;
 }
 
@@ -142,6 +153,8 @@ static void apply_kv(LsTelemetry* t, char* tok) {
         t->free_dma = (uint32_t)strtoul(v, NULL, 10);
     else if((v = kv(tok, "stl")))
         t->sdr_stall_s = atoi(v);
+    else if((v = kv(tok, "rhs")))
+        copy_field(t->rtl_health, sizeof(t->rtl_health), v);
 
     else if((v = kv(tok, "eq")))
         t->eq_preset = atoi(v);
@@ -245,12 +258,51 @@ static void apply_kv(LsTelemetry* t, char* tok) {
     else if((v = kv(tok, "ptx")))
         copy_field(t->pocsag_last_text, sizeof(t->pocsag_last_text), v);
 
+    else if((v = kv(tok, "rph")))
+        t->rec_phase = atoi(v);
+    else if((v = kv(tok, "red")))
+        t->rec_edges = atoi(v);
+    else if((v = kv(tok, "rsp")))
+        t->rec_span_us = (uint32_t)strtoul(v, NULL, 10);
+    else if((v = kv(tok, "rmg")))
+        t->rec_mag = atoi(v);
+    else if((v = kv(tok, "rfl")))
+        t->rec_floor = atoi(v);
+    else if((v = kv(tok, "rth")))
+        t->rec_thresh = atoi(v);
+    else if((v = kv(tok, "rtf")))
+        t->rec_thresh_fixed = atoi(v);
+    else if((v = kv(tok, "rgp")))
+        t->rec_gap_ms = atoi(v);
+    else if((v = kv(tok, "rcp")))
+        t->rec_captures = (uint32_t)strtoul(v, NULL, 10);
+    else if((v = kv(tok, "rbw")))
+        t->rec_bw_hz = (uint32_t)strtoul(v, NULL, 10);
+    else if((v = kv(tok, "rmp")))
+        t->rec_min_pulse_us = (uint32_t)strtoul(v, NULL, 10);
+    else if((v = kv(tok, "rms")))
+        t->rec_max_span_ms = (uint32_t)strtoul(v, NULL, 10);
+    else if((v = kv(tok, "rme")))
+        t->rec_min_edges = atoi(v);
+    else if((v = kv(tok, "ren")))
+        t->rec_end_reason = atoi(v);
+    else if((v = kv(tok, "rmn")))
+        t->rec_min_mark_us = (uint32_t)strtoul(v, NULL, 10);
+    else if((v = kv(tok, "rmx")))
+        t->rec_max_mark_us = (uint32_t)strtoul(v, NULL, 10);
+    else if((v = kv(tok, "rbd")))
+        t->rec_baud_est = (uint32_t)strtoul(v, NULL, 10);
+    else if((v = kv(tok, "rlf")))
+        copy_field(t->rec_last_file, sizeof(t->rec_last_file), v);
+
     else if((v = kv(tok, "ac")))
         t->ac_tracked = atoi(v);
     else if((v = kv(tok, "acn")))
         t->ac_count = atoi(v);
     else if((v = kv(tok, "mt")))
         t->msgs_total = atoi(v);
+    else if((v = kv(tok, "tv")))
+        t->tts_vol = atoi(v);
     else if((v = kv(tok, "mps")))
         t->msgs_sec = atoi(v);
     else if((v = kv(tok, "cg")))
@@ -271,6 +323,7 @@ static LsMode mode_from_name(const char* name) {
     if(!strcmp(name, "FM")) return LsModeFm;
     if(!strcmp(name, "ADSB") || !strcmp(name, "ADS-B")) return LsModeAdsb;
     if(!strcmp(name, "P25")) return LsModeP25;
+    if(!strcmp(name, "REC")) return LsModeRec;
     return LsModeUnknown;
 }
 
@@ -367,8 +420,65 @@ static void parse_eq_line(LsLink* link, char* line) {
     furi_mutex_release(link->lock);
 }
 
+static void parse_rec_chunk(LsLink* link, char* line) {
+    if(line[0] != 'D') return;
+
+    char* p = line + 1;
+    char* end = NULL;
+
+    uint32_t off = (uint32_t)strtoul(p, &end, 10);
+    if(end == p) return;
+    p = end;
+
+    long count = strtol(p, &end, 10);
+    if(end == p || count < 0 || count > LS_REC_CHUNK) return;
+    p = end;
+
+    int32_t vals[LS_REC_CHUNK];
+    int n = 0;
+    while(n < count) {
+        long v = strtol(p, &end, 10);
+        if(end == p) break;
+        vals[n++] = (int32_t)v;
+        p = end;
+    }
+    if(n != count) return;
+
+    furi_mutex_acquire(link->lock, FuriWaitForever);
+    memcpy(link->rec_chunk, vals, sizeof(int32_t) * (size_t)n);
+    link->rec_offset = off;
+    link->rec_count = n;
+    link->rec_pending = true;
+    furi_mutex_release(link->lock);
+}
+
+bool ls_link_rec_take(LsLink* link, uint32_t* offset, int* count, int32_t* out, int max) {
+    furi_mutex_acquire(link->lock, FuriWaitForever);
+    bool got = link->rec_pending;
+    if(got) {
+        link->rec_pending = false;
+        int n = link->rec_count;
+        if(n > max) n = max;
+        if(offset) *offset = link->rec_offset;
+        if(count) *count = n;
+        if(out && n > 0) memcpy(out, link->rec_chunk, sizeof(int32_t) * (size_t)n);
+    }
+    furi_mutex_release(link->lock);
+    return got;
+}
+
+void ls_link_rec_reset(LsLink* link) {
+    furi_mutex_acquire(link->lock, FuriWaitForever);
+    link->rec_pending = false;
+    link->rec_count = 0;
+    link->rec_offset = 0;
+    furi_mutex_release(link->lock);
+}
+
 static void handle_line(LsLink* link, char* line) {
-    if(line[0] == '&') {
+    if(line[0] == '%') {
+        parse_rec_chunk(link, line + 1);
+    } else if(line[0] == '&') {
         parse_eq_line(link, line + 1);
     } else if(line[0] == '$') {
 
@@ -752,11 +862,7 @@ void ls_link_send(LsLink* link, const char* fmt, ...) {
         if(link->ble_profile) {
 
             bool ok = ls_ble_profile_tx(link->ble_profile, (const uint8_t*)buf, (uint16_t)n);
-            if(!ok) {
-                furi_delay_ms(10);
-                ok = ls_ble_profile_tx(link->ble_profile, (const uint8_t*)buf, (uint16_t)n);
-            }
-            if(!ok) FURI_LOG_W(TAG, "ble tx dropped (%d B)", n);
+            if(!ok) FURI_LOG_W(TAG, "ble tx reported failure (%d B)", n);
         }
         return;
     }
