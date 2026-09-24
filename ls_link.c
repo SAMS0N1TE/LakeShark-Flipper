@@ -37,13 +37,38 @@ struct LsLink {
     uint32_t replies;
     uint32_t bad;
 
+    LsRecLoadAck rec_load_ack;
+    uint32_t rec_load_ack_seq;
+
+    LsPsys psys;
+    uint32_t psys_seq;
+    LsProfRow prof;
+    bool prof_pending;
+
     char last_reply[64];
     uint32_t last_reply_tick;
+
+    /*LS-841  The radio's own version string, kept apart from last_reply.
+
+       last_reply is whatever came back most recently, and the probe timer
+       overwrites it with a pong within a second or two - fine for a status
+       line, useless for "what firmware is the radio running". The VER reply
+       identifies itself, so it is captured wherever it appears rather than
+       being matched to a request. */
+    char radio_ver[96];
 
     int32_t rec_chunk[LS_REC_CHUNK];
     uint32_t rec_offset;
     int rec_count;
     bool rec_pending;
+
+    /*LS-526*/
+    int rec_file_index;
+    int rec_file_total;
+    uint32_t rec_file_freq;
+    long rec_file_size;
+    char rec_file_name[LS_REC_NAME_MAX];
+    bool rec_file_pending;
 
     LsTransport transport;
     Bt* bt;
@@ -72,15 +97,17 @@ static void copy_field(char* dst, size_t dst_len, const char* src) {
         if(*p == '_') *p = ' ';
 }
 
+/*LS-832  Ten: the eight an aircraft always has, plus lat and lon. */
+#define AC_FIELD_MAX 10
+
 static void parse_aircraft(LsTelemetry* t, int slot, char* v) {
     if(slot < 0 || slot >= LS_AC_MAX) return;
 
-    /**/
-    char* field[11] = {0};
+    char* field[AC_FIELD_MAX] = {0};
     int n = 0;
     char* p = v;
     field[n++] = p;
-    while(*p && n < 11) {
+    while(*p && n < AC_FIELD_MAX) {
         if(*p == ',') {
             *p++ = '\0';
             field[n++] = p;
@@ -88,6 +115,10 @@ static void parse_aircraft(LsTelemetry* t, int slot, char* v) {
         }
         p++;
     }
+    /*LS-832  Eight fields is a complete aircraft; ten means it also carries a
+       position. Accept both so a head can talk to a radio that predates
+       positions on the wire, and so an aircraft the decoder has not fixed yet
+       is simply shorter rather than special. */
     if(n < 8) return;
 
     LsAircraft* a = &t->ac[slot];
@@ -100,10 +131,16 @@ static void parse_aircraft(LsTelemetry* t, int slot, char* v) {
     a->age_ms = atoi(field[6]);
     a->msg_count = atoi(field[7]);
 
-    a->pos_valid = (n >= 11) && atoi(field[8]) != 0;
-    a->lat_e4 = (n >= 11) ? (int32_t)strtol(field[9], NULL, 10) : 0;
-    a->lon_e4 = (n >= 11) ? (int32_t)strtol(field[10], NULL, 10) : 0;
-
+    /*LS-832*/
+    if(n >= 10) {
+        a->lat_e4 = atoi(field[8]);
+        a->lon_e4 = atoi(field[9]);
+        a->pos_valid = true;
+    } else {
+        a->lat_e4 = 0;
+        a->lon_e4 = 0;
+        a->pos_valid = false;
+    }
     a->seen = true;
 }
 
@@ -153,8 +190,6 @@ static void apply_kv(LsTelemetry* t, char* tok) {
         t->free_dma = (uint32_t)strtoul(v, NULL, 10);
     else if((v = kv(tok, "stl")))
         t->sdr_stall_s = atoi(v);
-    else if((v = kv(tok, "rhs")))
-        copy_field(t->rtl_health, sizeof(t->rtl_health), v);
 
     else if((v = kv(tok, "eq")))
         t->eq_preset = atoi(v);
@@ -301,8 +336,6 @@ static void apply_kv(LsTelemetry* t, char* tok) {
         t->ac_count = atoi(v);
     else if((v = kv(tok, "mt")))
         t->msgs_total = atoi(v);
-    else if((v = kv(tok, "tv")))
-        t->tts_vol = atoi(v);
     else if((v = kv(tok, "mps")))
         t->msgs_sec = atoi(v);
     else if((v = kv(tok, "cg")))
@@ -420,6 +453,74 @@ static void parse_eq_line(LsLink* link, char* line) {
     furi_mutex_release(link->lock);
 }
 
+/*LS-526*/
+/* %S <index> <total> <freq_hz> <bytes> <name>  - one saved capture per reply.
+   The board enumerates its directory one entry per round trip (LS-032) rather
+   than trying to fit every name in one 384 B line, so this parser handles a
+   single row and the UI walks index 0..total-1. */
+static void parse_prof(LsLink* link, char* line);
+
+static void parse_rec_file(LsLink* link, char* line) {
+    char* p = line + 1;
+    char* end = NULL;
+
+    long index = strtol(p, &end, 10);
+    if(end == p) return;
+    p = end;
+
+    long total = strtol(p, &end, 10);
+    if(end == p || total < 0) return;
+    p = end;
+
+    unsigned long freq = strtoul(p, &end, 10);
+    if(end == p) return;
+    p = end;
+
+    long size = strtol(p, &end, 10);
+    if(end == p) return;
+    p = end;
+
+    while(*p == ' ') p++;
+
+    furi_mutex_acquire(link->lock, FuriWaitForever);
+    link->rec_file_index = (int)index;
+    link->rec_file_total = (int)total;
+    link->rec_file_freq = (uint32_t)freq;
+    link->rec_file_size = size;
+    strncpy(link->rec_file_name, p, sizeof(link->rec_file_name) - 1);
+    link->rec_file_name[sizeof(link->rec_file_name) - 1] = '\0';
+    /* The board sends "-" for an empty directory; keep it as an empty name so
+       the UI does not draw a row called "-". */
+    if(!strcmp(link->rec_file_name, "-")) link->rec_file_name[0] = '\0';
+    link->rec_file_pending = true;
+    furi_mutex_release(link->lock);
+}
+
+bool ls_link_rec_file_take(
+    LsLink* link,
+    int* index,
+    int* total,
+    uint32_t* freq_hz,
+    long* size,
+    char* name,
+    size_t name_len) {
+    furi_mutex_acquire(link->lock, FuriWaitForever);
+    bool got = link->rec_file_pending;
+    if(got) {
+        link->rec_file_pending = false;
+        if(index) *index = link->rec_file_index;
+        if(total) *total = link->rec_file_total;
+        if(freq_hz) *freq_hz = link->rec_file_freq;
+        if(size) *size = link->rec_file_size;
+        if(name && name_len) {
+            strncpy(name, link->rec_file_name, name_len - 1);
+            name[name_len - 1] = '\0';
+        }
+    }
+    furi_mutex_release(link->lock);
+    return got;
+}
+
 static void parse_rec_chunk(LsLink* link, char* line) {
     if(line[0] != 'D') return;
 
@@ -477,7 +578,13 @@ void ls_link_rec_reset(LsLink* link) {
 
 static void handle_line(LsLink* link, char* line) {
     if(line[0] == '%') {
-        parse_rec_chunk(link, line + 1);
+        /*LS-526*/
+        if(line[1] == 'S')
+            parse_rec_file(link, line + 1);
+        else if(line[1] == 'P')
+            parse_prof(link, line + 1);
+        else
+            parse_rec_chunk(link, line + 1);
     } else if(line[0] == '&') {
         parse_eq_line(link, line + 1);
     } else if(line[0] == '$') {
@@ -486,6 +593,28 @@ static void handle_line(LsLink* link, char* line) {
         parse_telemetry(link, line + 1);
     } else if(line[0] == '+' || line[0] == '-') {
         furi_mutex_acquire(link->lock, FuriWaitForever);
+        /*LS-841  "+OK LakeShark_1.0.1-g8cc5b7be_board_..." - self-identifying,
+           so no request tracking is needed and an older radio that never sends
+           it simply leaves the field empty.
+
+           The separator is an underscore, not a space: the wire protocol is
+           space-delimited and the radio runs the version through sanitize()
+           before sending it. Accept either, because that is a property of the
+           transport rather than of the version string. */
+        if(!strncmp(line, "+OK LakeShark", 13) && (line[13] == '_' || line[13] == ' ')) {
+            strncpy(link->radio_ver, line + 4, sizeof(link->radio_ver) - 1);
+            link->radio_ver[sizeof(link->radio_ver) - 1] = '\0';
+        }
+        LsPsys psys;
+        if(ls_psys_parse(line, &psys)) {
+            link->psys = psys;
+            link->psys_seq++;
+        }
+        LsRecLoadAck ack;
+        if(ls_rec_load_ack_parse(line, &ack)) {
+            link->rec_load_ack = ack;
+            link->rec_load_ack_seq++;
+        }
         strncpy(link->last_reply, line, sizeof(link->last_reply) - 1);
         link->last_reply[sizeof(link->last_reply) - 1] = '\0';
         link->last_reply_tick = furi_get_tick();
@@ -627,8 +756,20 @@ LsLinkState ls_link_state(LsLink* link) {
 
     if(link->ble_starting) return LsStateBleStarting;
     if(link->ble_failed) return LsStateBleFailed;
+
+    /*LS-834  Believe the frames over the callback.
+
+       This asked ble_connected - a flag set from bt_set_status_changed_callback
+       - before it looked at whether anything was actually arriving. When that
+       callback does not fire, and on this firmware it often does not, the
+       launcher reported "advertising" forever while telemetry was streaming in
+       and every screen behind it was updating. An indicator that contradicts
+       the data path is worse than no indicator.
+
+       Frames arriving IS a connection. Nothing else needs to agree. */
+    if(up) return LsStateBleUp;
     if(!link->ble_connected) return LsStateBleAdvertising;
-    return up ? LsStateBleUp : LsStateBleConnected;
+    return LsStateBleConnected;
 }
 
 const char* ls_link_state_str(LsLink* link) {
@@ -831,6 +972,14 @@ void ls_link_stats(LsLink* link, uint32_t* frames, uint32_t* replies, uint32_t* 
     furi_mutex_release(link->lock);
 }
 
+void ls_link_radio_version(LsLink* link, char* out, size_t out_len) {
+    if(!out || out_len == 0) return;
+    furi_mutex_acquire(link->lock, FuriWaitForever);
+    strncpy(out, link->radio_ver, out_len - 1);
+    out[out_len - 1] = '\0';
+    furi_mutex_release(link->lock);
+}
+
 void ls_link_last_reply(LsLink* link, char* out, size_t out_len) {
     furi_mutex_acquire(link->lock, FuriWaitForever);
     strncpy(out, link->last_reply, out_len - 1);
@@ -869,4 +1018,38 @@ void ls_link_send(LsLink* link, const char* fmt, ...) {
 
     furi_hal_serial_tx(link->serial, (const uint8_t*)buf, (size_t)n);
     furi_hal_serial_tx_wait_complete(link->serial);
+}
+
+static void parse_prof(LsLink* link, char* line) {
+    LsProfRow row;
+    if(!ls_prof_row_parse(line, &row)) return;
+    furi_mutex_acquire(link->lock, FuriWaitForever);
+    link->prof = row;
+    link->prof_pending = true;
+    furi_mutex_release(link->lock);
+}
+
+bool ls_link_prof_take(LsLink* link, LsProfRow* out) {
+    furi_mutex_acquire(link->lock, FuriWaitForever);
+    bool had = link->prof_pending;
+    if(had && out) *out = link->prof;
+    link->prof_pending = false;
+    furi_mutex_release(link->lock);
+    return had;
+}
+
+uint32_t ls_link_psys(LsLink* link, LsPsys* out) {
+    furi_mutex_acquire(link->lock, FuriWaitForever);
+    if(out) *out = link->psys;
+    uint32_t seq = link->psys_seq;
+    furi_mutex_release(link->lock);
+    return seq;
+}
+
+uint32_t ls_link_rec_load_reply(LsLink* link, LsRecLoadAck* out) {
+    furi_mutex_acquire(link->lock, FuriWaitForever);
+    if(out) *out = link->rec_load_ack;
+    uint32_t seq = link->rec_load_ack_seq;
+    furi_mutex_release(link->lock);
+    return seq;
 }

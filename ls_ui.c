@@ -83,6 +83,16 @@ static void edit_wrap(char* out, size_t len, const char* value) {
     snprintf(out, len, "<%s>", value ? value : "");
 }
 
+/*LS-845  Values stop short of the right edge, not at it.
+
+   elements_scrollbar draws in the last three columns, and every list page
+   that shows a value also scrolls - so a value right-aligned to the edge had
+   its last character sitting under the scrollbar. It went unnoticed while
+   values were short; "3000ft 220kt" on the traffic list made it obvious the
+   first time the screen was actually photographed. Pages with no scrollbar
+   just gain three pixels of margin. */
+#define LS_VALUE_RIGHT 6
+
 void ls_ui_row_edit(
     Canvas* c,
     int y,
@@ -104,10 +114,10 @@ void ls_ui_row_edit(
     }
 
     int base = y + LS_ROW_H - 3;
-    int avail = w - 6;
+    int avail = w - 3 - LS_VALUE_RIGHT;
 
     if(value && value[0]) {
-        canvas_draw_str_aligned(c, w - 3, base, AlignRight, AlignBottom, value);
+        canvas_draw_str_aligned(c, w - LS_VALUE_RIGHT, base, AlignRight, AlignBottom, value);
         avail -= canvas_string_width(c, value) + 4;
     }
 
@@ -176,7 +186,7 @@ void ls_ui_level_edit(
     canvas_draw_str(c, 3, base, label);
 
     int vw = value && value[0] ? canvas_string_width(c, value) : 0;
-    if(vw) canvas_draw_str_aligned(c, w - 3, base, AlignRight, AlignBottom, value);
+    if(vw) canvas_draw_str_aligned(c, w - LS_VALUE_RIGHT, base, AlignRight, AlignBottom, value);
 
     int lw = canvas_string_width(c, label);
     int bx = 3 + lw + 4;
@@ -268,4 +278,64 @@ void ls_ui_age(char* out, size_t len, int32_t age_ms) {
     } else {
         snprintf(out, len, "%ldh", (long)(age_ms / 3600000));
     }
+}
+
+/*LS-844  A list row with a glyph in front of the label.
+
+   The launcher was six rows of the same shape, told apart only by reading
+   them. An icon column turns "which one is ADS-B" into something the eye
+   answers before the words are read - which matters most on the screen you
+   see every time the app opens.
+
+   canvas_draw_xbm honours the current colour, so the selected row inverts
+   the icon along with everything else and needs no special case. */
+void ls_ui_row_icon(
+    Canvas* c,
+    int y,
+    const uint8_t* icon,
+    const char* label,
+    const char* value,
+    bool selected) {
+    const int w = canvas_width(c);
+
+    if(selected) {
+        canvas_draw_box(c, 0, y, w, LS_ROW_H);
+        canvas_set_color(c, ColorWhite);
+    }
+
+    const int base = y + LS_ROW_H - 3;
+    if(icon) canvas_draw_xbm(c, 2, y + (LS_ROW_H - 8) / 2, 8, 8, icon);
+
+    canvas_set_font(c, FontSecondary);
+    if(value && value[0]) {
+        canvas_draw_str_aligned(c, w - LS_VALUE_RIGHT, base, AlignRight, AlignBottom, value);
+    }
+    canvas_draw_str(c, 13, base, label);
+
+    if(selected) canvas_set_color(c, ColorBlack);
+}
+
+/*LS-840  A row whose value is a yes/no, drawn as a box instead of the word
+   "on". Alert settings are eight of these in a column; read as text they are a
+   wall of the same two words, and the eye has to parse every line to find the
+   one that is different. As boxes the state is the shape, and the odd one out
+   is visible without reading. Inset far enough to clear a scrollbar. */
+void ls_ui_row_check(Canvas* c, int y, const char* label, bool on, bool selected) {
+    const int w = canvas_width(c);
+    const int box = 7;
+    const int bx = w - 6 - box;
+    const int by = y + (LS_ROW_H - box) / 2;
+
+    if(selected) {
+        canvas_draw_box(c, 0, y, w, LS_ROW_H);
+        canvas_set_color(c, ColorWhite);
+    }
+
+    canvas_set_font(c, FontSecondary);
+    canvas_draw_str(c, 3, y + LS_ROW_H - 3, label);
+
+    canvas_draw_frame(c, bx, by, box, box);
+    if(on) canvas_draw_box(c, bx + 2, by + 2, box - 4, box - 4);
+
+    if(selected) canvas_set_color(c, ColorBlack);
 }

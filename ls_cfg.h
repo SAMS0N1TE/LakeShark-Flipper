@@ -36,6 +36,15 @@ typedef struct {
     bool want_ble;
     bool ble_proven;
     bool rx_wake;
+
+    /*LS-840  Alerts. Kept as plain fields rather than an LsAlertCtx so config
+       does not have to know about the alert stack; lakeshark_p25.c maps them
+       across at startup. alert_mask is one bit per LsAlertKind, in enum
+       order. */
+    bool alert_led;
+    bool alert_vibro;
+    int alert_tone;
+    uint8_t alert_mask;
 } LsCfg;
 
 extern const char* const LS_BOOT_NAMES[LsBootCount];

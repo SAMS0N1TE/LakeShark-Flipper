@@ -6,6 +6,8 @@
 #include <storage/storage.h>
 #include <toolbox/stream/file_stream.h>
 #include <furi_hal_bt.h>
+/*LS-526*/
+#include <loader/loader.h>
 
 #include <stddef.h>
 #include <stdio.h>
@@ -14,6 +16,14 @@
 
 #include "ls_link.h"
 #include "ls_ui.h"
+#include "ls_map.h"
+#include "ls_notify.h" /*LS-840*/
+#include "ls_rtttl.h"  /*LS-840*/
+
+/*LS-841  Kept in step with fap_version in application.fam by hand; the
+   build does not hand it to us, and a version the ABOUT page invents is
+   worse than none. */
+#define LS_HEAD_VERSION "v2.6"   /*LS-836*/
 #include "ls_cfg.h"
 #include "ls_dbg.h"
 
@@ -89,11 +99,13 @@ typedef enum {
     PG_TRAFFIC,
     PG_AIRCRAFT,
     PG_ADSB_STAT,
-    /**/
     PG_ADSB_MAP,
     PG_REC,
     PG_REC_SIG,
     PG_REC_CAP,
+    /*LS-526*/
+    PG_REC_FILES,
+    PG_P25_SYS,
 } LsPage;
 
 typedef struct {
@@ -104,14 +116,15 @@ typedef struct {
     int n_pages;
 } LsAppDef;
 
-static const LsPage P25_PAGES[] = {PG_VFO, PG_SIGNAL, PG_CALL, PG_MEM, PG_DIAG};
+static const LsPage P25_PAGES[] = {PG_VFO, PG_SIGNAL, PG_CALL, PG_P25_SYS, PG_MEM, PG_DIAG};
 static const LsPage FM_PAGES[] = {PG_VFO, PG_SIGNAL, PG_FM_SCAN, PG_MEM, PG_DIAG};
 
 static const LsPage POC_PAGES[] = {PG_POC, PG_VFO, PG_POC_LOG, PG_MEM, PG_SIGNAL, PG_DIAG};
-/**/
 static const LsPage ADSB_PAGES[] =
     {PG_TRAFFIC, PG_AIRCRAFT, PG_ADSB_MAP, PG_ADSB_STAT, PG_SIGNAL, PG_DIAG};
-static const LsPage REC_PAGES[] = {PG_REC, PG_REC_SIG, PG_REC_CAP, PG_MEM, PG_DIAG};
+/*LS-526*/
+static const LsPage REC_PAGES[] = {
+    PG_REC, PG_REC_SIG, PG_REC_CAP, PG_REC_FILES, PG_MEM, PG_DIAG};
 
 static const LsAppDef APPS[LsRadioCount] = {
     {"P25", "p25", "MODE p25", P25_PAGES, (int)(sizeof(P25_PAGES) / sizeof(LsPage))},
@@ -127,12 +140,60 @@ typedef enum {
     SET_LINK,
     SET_DEVICE,
     SET_DISPLAY,
+    SET_ALERTS,
     SET_ABOUT,
     SET_COUNT,
 } LsSetPage;
 
+/*LS-840  Rows on the alerts page: what it can do, then what it does it for,
+   then a way to hear the result. The order matters - the output choices are
+   what an operator changes most, and the test belongs at the end where it
+   reads as "try that". */
+typedef enum {
+    ALR_LED,
+    ALR_VIBRO,
+    ALR_TONE,
+    ALR_PAGE,
+    ALR_VOICE,
+    ALR_AIR,
+    ALR_CAP,
+    ALR_LINK,
+    ALR_TEST,
+    ALR_COUNT,
+} LsAlrRow;
+
+static const char* const ALR_LABELS[ALR_COUNT] = {
+    "LED flash",
+    "Vibrate",
+    "Tone",
+    "On page",
+    "On voice",
+    "On aircraft",
+    "On capture",
+    "On link up",
+    "Test alert",
+};
+
+/* One table, so the draw, the toggle and the enable cannot drift apart. */
+static int alr_kind(int row) {
+    switch(row) {
+    case ALR_PAGE:
+        return LsAlertPage;
+    case ALR_VOICE:
+        return LsAlertVoice;
+    case ALR_AIR:
+        return LsAlertAircraft;
+    case ALR_CAP:
+        return LsAlertCapture;
+    case ALR_LINK:
+        return LsAlertLink;
+    default:
+        return -1;
+    }
+}
+
 static const char* const SET_TITLES[SET_COUNT] =
-    {"LEVELS", "AUDIO", "LINK", "DEVICE", "DISPLAY", "ABOUT"};
+    {"LEVELS", "AUDIO", "LINK", "DEVICE", "DISPLAY", "ALERTS", "ABOUT"};
 
 typedef enum {
     LsScreenLauncher,
@@ -148,7 +209,6 @@ typedef struct {
     uint8_t fill[HIST_N];
     uint8_t voice[HIST_N];
     uint8_t mag[HIST_N];
-    /**/
     uint8_t audio[HIST_N];
     uint8_t msgs[HIST_N];
     uint8_t tracked[HIST_N];
@@ -161,7 +221,17 @@ typedef struct {
     uint32_t freq_hz;
 } LsMem;
 
-#define POC_LOG_MAX 16
+/*LS-830  16 was a keepsake, not a log. POCSAG arrives in floods - a paging
+   hub pushes dozens in a few seconds - and 16 entries scroll away before you
+   can look up. 48 costs about 4.6 KB and holds a minute of a busy channel
+   rather than ten seconds. */
+#define POC_LOG_MAX 48
+
+/*LS-830  Seconds of page-rate history behind the flood tape. 64 columns is
+   also 64 pixels, half the Flipper's width, so the tape draws one pixel per
+   second with no scaling and no arithmetic to get wrong. */
+#define POC_TAPE_N 64
+#define POC_STRIP_H 10
 
 #define POC_TEXT_MAX 80
 typedef struct {
@@ -195,10 +265,18 @@ typedef enum {
     ECHO_REC_MINP,
     ECHO_REC_MAXSPAN,
     ECHO_REC_MINEDGES,
-    /**/
-    ECHO_TTSVOL,
     ECHO_COUNT,
 } LsEchoId;
+
+/*LS-526*/
+#define REC_FILES_MAX 32
+#define PROF_MAX 16
+
+typedef struct {
+    char name[LS_REC_NAME_MAX];
+    uint32_t freq_hz;
+    long size;
+} RecFileEntry;
 
 typedef struct {
     Gui* gui;
@@ -231,6 +309,8 @@ typedef struct {
     uint32_t last_frames;
     int32_t prev_bch_ok;
     int32_t prev_bch_fail;
+    int32_t prev_crc_good;
+    int32_t prev_crc_err;
 
     LsEcho echo[ECHO_COUNT];
 
@@ -241,6 +321,35 @@ typedef struct {
 
     LsPocEntry poc[POC_LOG_MAX];
     int poc_count;
+    /*LS-836  The map keeps its own context rather than reaching into LsApp,
+       so the same renderer can be lifted onto the P4 later without dragging
+       this struct with it. */
+    LsMapCtx map_ctx;
+    bool map_ready;
+
+    /*LS-840  Alerts. A receiver you are not looking at has to say when
+       something happened, so the head buzzes, blinks or plays a tone.
+
+       Playback runs on its own thread and nothing else will do. A ringtone is
+       a second or more of furi_delay_ms, and every event that raises an alert
+       is raised from the main loop while it holds app->lock - the same loop
+       that services input, probes the link and drives the map. Playing there
+       would stall all of it, and during a POCSAG flood it would stall it
+       continuously. So ls_alert only releases a semaphore. */
+    LsAlertCtx alerts;
+    LsAlertCtx alert_playback; /* Heap snapshot: keep large file list off worker stack. */
+    atomic_uint alert_generation;
+    FuriThread* alert_thr;
+    FuriSemaphore* alert_sig;
+    atomic_bool alert_run;
+    uint32_t alert_next;
+    int alert_prev_ac;
+
+    /*LS-830*/
+    bool poc_detail;              /* full-screen view of the focused page */
+    uint32_t poc_total;           /* every page seen, including aged-out ones */
+    uint8_t poc_rate[POC_TAPE_N]; /* pages per second, ring indexed by second */
+    uint32_t poc_sec;             /* second poc_rate was last advanced to */
     uint32_t poc_last_addr;
     char poc_last_text[POC_TEXT_MAX];
 
@@ -264,11 +373,49 @@ typedef struct {
     int rec_have;
     int rec_total;
     uint32_t rec_freq_hz;
+    uint32_t rec_expected_span_us;
     int rec_xfer;
+
+    /*LS-526*/
+    RecFileEntry rec_files[REC_FILES_MAX];
+    int rec_files_n;
+    int rec_files_total;
+    int rec_files_sel;
+    int rec_files_top;
+    int rec_files_want;
+    uint32_t rec_files_deadline;
+    bool rec_files_busy;
+    int rec_files_retries;
+
+    /* P25 SYSTEM page: the radio's PSYS status and its card profiles. */
+    LsPsys psys;
+    uint32_t psys_seq;
+    bool psys_known;
+    int psys_asked;
+    uint32_t psys_next;
+    bool sys_active;
+    char prof_name[PROF_MAX][LS_PSYS_TEXT];
+    char prof_system[PROF_MAX][LS_PSYS_TEXT];
+    int prof_n;
+    int prof_want;
+    int prof_top;
+    int prof_retries;
+    uint32_t prof_deadline;
+    bool prof_busy;
+    int rec_load_idx;
+    uint32_t rec_load_seq;
+    uint32_t rec_load_deadline;
+    char rec_open_path[96];
+    bool rec_from_files;
     uint32_t rec_deadline;
     int rec_retries;
     int rec_view;
     char rec_file[40];
+
+    /*LS-842  What we last told the radio, not what it is - there is no
+       telemetry field for the log level, and asking would cost a round trip
+       for something the operator just set. Starts at the firmware default. */
+    int log_level;
 
     bool prev_voice;
     bool prev_sdr_bad;
@@ -365,8 +512,7 @@ static uint8_t pct_of(int32_t v, int32_t full) {
     return (uint8_t)(p > 100 ? 100 : p);
 }
 
-/**/
-
+/* Full-scale IQ byte rate for the receiver each app runs. */
 static int32_t iq_rate_full(LsApp* app) {
     switch(app->app) {
     case LsRadioAdsb:
@@ -392,7 +538,6 @@ static void hist_push(LsApp* app) {
 
     h->sig[h->head] = signal_pct(t->iq_level);
     h->err[h->head] = (dok + dfail) > 0 ? pct_of(dfail, dok + dfail) : 0;
-    /**/
     h->bps[h->head] = pct_of((int32_t)t->iq_bytes_sec, iq_rate_full(app));
     h->fill[h->head] = pct_of(t->ring_fill, t->ring_size);
     h->voice[h->head] = t->voice_active ? 2 : (t->has_sync ? 1 : 0);
@@ -400,6 +545,15 @@ static void hist_push(LsApp* app) {
     h->audio[h->head] = pct_of(t->audio_level, 100);
     h->msgs[h->head] = pct_of(t->msgs_sec, 50);
     h->tracked[h->head] = pct_of(t->ac_tracked, 24);
+    /* ADS-B has no BCH: its error trace is the CRC failure share. */
+    if(app->app == LsRadioAdsb) {
+        int32_t cg = t->crc_good - app->prev_crc_good;
+        int32_t ce = t->crc_err - app->prev_crc_err;
+        if(cg < 0 || ce < 0) cg = ce = 0;
+        app->prev_crc_good = t->crc_good;
+        app->prev_crc_err = t->crc_err;
+        h->err[h->head] = (cg + ce) > 0 ? pct_of(ce, cg + ce) : 0;
+    }
 
     h->head = (h->head + 1) % HIST_N;
     if(h->count < HIST_N) h->count++;
@@ -605,6 +759,75 @@ static void mem_delete(LsApp* app, int idx) {
     toast(app, "Deleted");
 }
 
+/*LS-840  An alert every time anything happens is an alert nobody reads, so
+   two gates sit in front of playback: the per-event switch the operator set,
+   and a floor on how often any alert may fire. The floor is what makes a
+   POCSAG flood survivable - 30 pages a second should feel like a flood, not
+   like 30 alerts.
+
+   Called with app->lock held. Everything here must be non-blocking. */
+#define ALERT_MIN_GAP_MS 1500
+
+static void ls_alert_feedback(LsApp* app) {
+    if(!app->alerts.led && !app->alerts.vibro && app->alerts.ringtone == RingtoneNone) return;
+
+    uint32_t now = furi_get_tick();
+    if(app->alert_next && now < app->alert_next) return;
+    app->alert_next = now + furi_ms_to_ticks(ALERT_MIN_GAP_MS);
+
+    /* Max count 1: a burst coalesces into one alert instead of queueing a
+       backlog that would still be playing minutes later. A full semaphore
+       returns an error here, which is the intended outcome. */
+    furi_semaphore_release(app->alert_sig);
+}
+
+static void ls_alert(LsApp* app, LsAlertKind kind) {
+    if(kind >= LsAlertCount || !app->alerts.on[kind]) return;
+    ls_alert_feedback(app);
+}
+
+static int32_t alert_worker(void* ctx) {
+    LsApp* app = ctx;
+    while(app->alert_run) {
+        if(furi_semaphore_acquire(app->alert_sig, furi_ms_to_ticks(200)) != FuriStatusOk)
+            continue;
+        if(!app->alert_run) break;
+
+        furi_mutex_acquire(app->lock, FuriWaitForever);
+        app->alert_playback = app->alerts;
+        app->alert_playback.generation = &app->alert_generation;
+        app->alert_playback.playback_generation = atomic_load(&app->alert_generation);
+        bool running = atomic_load(&app->alert_run);
+        furi_mutex_release(app->lock);
+        if(running) notify_rx_message(&app->alert_playback);
+    }
+    return 0;
+}
+
+/*LS-840  Config holds plain fields so it need not know about the alert stack;
+   these two carry them across. */
+static void alerts_from_cfg(LsApp* app) {
+    app->alerts.led = app->cfg.alert_led;
+    app->alerts.vibro = app->cfg.alert_vibro;
+    app->alerts.ringtone = (uint16_t)app->cfg.alert_tone;
+    for(int k = 0; k < LsAlertCount; k++)
+        app->alerts.on[k] = (app->cfg.alert_mask & (1u << k)) != 0;
+}
+
+static void alerts_to_cfg(LsApp* app) {
+    /* Cancel current playback and drop pending alerts on any settings edit. */
+    atomic_fetch_add(&app->alert_generation, 1);
+    while(furi_semaphore_acquire(app->alert_sig, 0) == FuriStatusOk) {}
+    app->cfg.alert_led = app->alerts.led;
+    app->cfg.alert_vibro = app->alerts.vibro;
+    app->cfg.alert_tone = (int)app->alerts.ringtone;
+    uint8_t m = 0;
+    for(int k = 0; k < LsAlertCount; k++)
+        if(app->alerts.on[k]) m |= (uint8_t)(1u << k);
+    app->cfg.alert_mask = m;
+    ls_cfg_save(&app->cfg);
+}
+
 static void poc_ingest(LsApp* app) {
     LsTelemetry* t = &app->tel;
     if(!t->pocsag_last_text[0] && !t->pocsag_last_addr) return;
@@ -624,7 +847,31 @@ static void poc_ingest(LsApp* app) {
     e->tick = furi_get_tick();
     if(app->poc_count < POC_LOG_MAX) app->poc_count++;
 
-    notification_message(app->notif, &sequence_blink_blue_10);
+    /*LS-830  Count it in the tape whether or not the log kept it. The log is
+       what a page SAID; the tape is how many ARRIVED, and during a flood those
+       are very different numbers - which is exactly the thing the tape exists
+       to answer. */
+    app->poc_total++;
+    {
+        uint32_t sec = furi_get_tick() / 1000u;
+        if(sec != app->poc_sec) {
+            /* Zero the seconds that passed with nothing in them, so a quiet
+               gap reads as a gap instead of leaving stale bars standing. */
+            uint32_t gap = sec - app->poc_sec;
+            if(gap > POC_TAPE_N) gap = POC_TAPE_N;
+            for(uint32_t g = 1; g <= gap; g++)
+                app->poc_rate[(app->poc_sec + g) % POC_TAPE_N] = 0;
+            app->poc_sec = sec;
+        }
+        uint8_t* slot = &app->poc_rate[sec % POC_TAPE_N];
+        if(*slot < 255) (*slot)++;
+    }
+
+    /*LS-840  A page is the event this app exists for. The blink is only
+       visible to someone already looking at the screen; the alert is for
+       everyone else. */
+    ls_alert(app, LsAlertPage);
+    /* LED feedback is emitted only by the configured alert dispatcher. */
 }
 
 #define REC_SUB_ROOT "/ext/subghz"
@@ -649,7 +896,13 @@ static void rec_preview_clear(LsApp* app) {
     app->rec_file[0] = '\0';
 }
 
-static bool rec_write_sub(LsApp* app, char* name_out, size_t name_len) {
+/*LS-526*/
+/* THE OLD NAME WAS LS_<khz>_<nnn>.sub AND EVERY FILE LOOKED THE SAME. Once the
+   board grew names of its own (LS-032), carrying one across is free and is the
+   difference between picking a capture and guessing at a list of siblings.
+   src_name is the board's name when this came from the browse page and NULL
+   when it is a live capture, which keeps the old counter for that case. */
+static bool rec_write_sub(LsApp* app, const char* src_name, char* name_out, size_t name_len) {
     Storage* storage = furi_record_open(RECORD_STORAGE);
     storage_common_mkdir(storage, REC_SUB_ROOT);
     storage_common_mkdir(storage, REC_SUB_DIR);
@@ -657,10 +910,31 @@ static bool rec_write_sub(LsApp* app, char* name_out, size_t name_len) {
     char path[96];
     unsigned long khz = (unsigned long)(app->rec_freq_hz / 1000);
     FileInfo info;
-    int idx = 1;
-    for(; idx < 1000; idx++) {
-        snprintf(path, sizeof(path), REC_SUB_DIR "/LS_%lu_%03d.sub", khz, idx);
-        if(storage_common_stat(storage, path, &info) != FSE_OK) break;
+
+    if(src_name && src_name[0]) {
+        /* <name>_<khz>.sub, and only add a counter if that already exists, so
+           the common case is the name the user typed on the board. */
+        /* The board's automatic names already end in the frequency
+           ("auto014_434070"); do not say it twice. */
+        char tail[16];
+        snprintf(tail, sizeof(tail), "_%lu", khz);
+        const size_t nl = strlen(src_name), tl = strlen(tail);
+        if(nl >= tl && !strcmp(src_name + nl - tl, tail)) tail[0] = '\0';
+
+        snprintf(path, sizeof(path), REC_SUB_DIR "/%s%s.sub", src_name, tail);
+        if(storage_common_stat(storage, path, &info) == FSE_OK) {
+            for(int idx = 2; idx < 1000; idx++) {
+                snprintf(
+                    path, sizeof(path), REC_SUB_DIR "/%s%s_%d.sub", src_name, tail, idx);
+                if(storage_common_stat(storage, path, &info) != FSE_OK) break;
+            }
+        }
+    } else {
+        int idx = 1;
+        for(; idx < 1000; idx++) {
+            snprintf(path, sizeof(path), REC_SUB_DIR "/LS_%lu_%03d.sub", khz, idx);
+            if(storage_common_stat(storage, path, &info) != FSE_OK) break;
+        }
     }
 
     bool ok = false;
@@ -694,6 +968,11 @@ static bool rec_write_sub(LsApp* app, char* name_out, size_t name_len) {
     stream_free(stream);
     furi_record_close(RECORD_STORAGE);
 
+    /*LS-526*/
+    if(ok) {
+        snprintf(app->rec_open_path, sizeof(app->rec_open_path), "%s", path);
+    }
+
     if(ok && name_out && name_len) {
         const char* base = strrchr(path, '/');
         if(!base) base = path;
@@ -707,29 +986,164 @@ static bool rec_write_sub(LsApp* app, char* name_out, size_t name_len) {
     return ok;
 }
 
+/*LS-526*/
+static void rec_xfer_start(LsApp* app);
+static void rec_xfer_start_capture(LsApp* app, int total, uint32_t freq_hz, uint32_t expected_span_us);
+
+/* Browsing the board's saved set. The board answers one entry per request
+   (LS-032), so this is a small pump: ask for index N, take the row, ask for
+   N+1, stop at total. A timeout just re-asks the same index - the reply is
+   idempotent, so a late duplicate costs nothing. */
+#define REC_FILES_TIMEOUT_MS 800
+
+static void rec_files_request(LsApp* app, int index) {
+    app->rec_files_want = index;
+    ls_link_send(app->link, "REC LS %d", index);
+    app->rec_files_deadline = furi_get_tick() + furi_ms_to_ticks(REC_FILES_TIMEOUT_MS);
+}
+
+static void rec_files_refresh(LsApp* app) {
+    if(!app->link_up) {
+        toast(app, "No radio");
+        return;
+    }
+    app->rec_files_n = 0;
+    app->rec_files_total = 0;
+    app->rec_files_retries = 0;
+    app->rec_files_busy = true;
+    rec_files_request(app, 0);
+}
+
+static void rec_files_tick(LsApp* app) {
+    if(!app->rec_files_busy) return;
+
+    int index = 0, total = 0;
+    uint32_t freq = 0;
+    long size = 0;
+    char name[LS_REC_NAME_MAX];
+
+    if(ls_link_rec_file_take(app->link, &index, &total, &freq, &size, name, sizeof(name))) {
+        app->rec_files_total = total;
+
+        if(total <= 0 || name[0] == '\0') {
+            app->rec_files_busy = false;
+            return;
+        }
+        if(index == app->rec_files_want && app->rec_files_n < REC_FILES_MAX) {
+            RecFileEntry* e = &app->rec_files[app->rec_files_n++];
+            strncpy(e->name, name, sizeof(e->name) - 1);
+            e->name[sizeof(e->name) - 1] = '\0';
+            e->freq_hz = freq;
+            e->size = size;
+        }
+        app->rec_files_retries = 0;
+        if(app->rec_files_n < total && app->rec_files_n < REC_FILES_MAX) {
+            rec_files_request(app, app->rec_files_n);
+        } else {
+            app->rec_files_busy = false;
+            if(app->rec_files_sel >= app->rec_files_n) app->rec_files_sel = app->rec_files_n - 1;
+            if(app->rec_files_sel < 0) app->rec_files_sel = 0;
+        }
+        return;
+    }
+
+    if(furi_get_tick() > app->rec_files_deadline) {
+        /* Per-request retries, reset on every row that lands. A function-static
+           counter would carry a partial failure into the next refresh and trip
+           the limit early on a link that had already recovered. */
+        if(++app->rec_files_retries > 4) {
+            app->rec_files_busy = false;
+            toast(app, "List timed out");
+            return;
+        }
+        rec_files_request(app, app->rec_files_want);
+    }
+}
+
+/* Wait for the selected file's fresh load acknowledgement. A cached DONE
+   telemetry frame can describe a smaller previous capture and silently cut
+   off the new download, or give it the previous file's frequency. */
+#define REC_LOAD_TIMEOUT_MS 2500
+
+static void rec_files_load_selected(LsApp* app) {
+    if(!app->link_up) {
+        toast(app, "No radio");
+        return;
+    }
+    if(app->rec_files_n <= 0) {
+        toast(app, "Nothing saved");
+        return;
+    }
+    if(app->rec_xfer != RecXferIdle) return;
+
+    app->rec_load_seq = ls_link_rec_load_reply(app->link, NULL);
+    app->rec_load_idx = app->rec_files_sel;
+    app->rec_load_deadline = furi_get_tick() + furi_ms_to_ticks(REC_LOAD_TIMEOUT_MS);
+    ls_link_send(app->link, "REC LOAD %d", app->rec_files_sel);
+    toast(app, "Loading...");
+}
+
+static void rec_files_load_tick(LsApp* app) {
+    if(app->rec_load_idx < 0) return;
+
+    LsRecLoadAck ack;
+    uint32_t seq = ls_link_rec_load_reply(app->link, &ack);
+    if(ls_rec_load_ack_ready(&ack, seq, app->rec_load_seq, app->rec_load_idx)) {
+        app->rec_load_idx = -1;
+        app->rec_from_files = true;
+        rec_xfer_start_capture(app, ack.edges, ack.freq_hz, ack.span_us);
+        return;
+    }
+    if(furi_get_tick() > app->rec_load_deadline) {
+        app->rec_load_idx = -1;
+        toast(app, "Load failed");
+    }
+}
+
+/* Hand the freshly written .sub straight to the stock Sub-GHz app. A running
+   app cannot start another - loader_start returns LoaderStatusErrorAppStarted -
+   so the launch is ENQUEUED and fires when this app exits, and we exit
+   immediately. That turns "Saved > lakeshark > guess which of the identical
+   ones" into one button. */
+static void rec_open_in_subghz(LsApp* app) {
+    if(app->rec_open_path[0] == '\0') {
+        toast(app, "Nothing saved yet");
+        return;
+    }
+    Loader* loader = furi_record_open(RECORD_LOADER);
+    /* "subghz" is the appid; some builds register the display name instead, so
+       fall back rather than silently doing nothing. */
+    loader_enqueue_launch(loader, "subghz", app->rec_open_path, LoaderDeferredLaunchFlagGui);
+    furi_record_close(RECORD_LOADER);
+
+    app->running = false;
+}
+
 static void rec_xfer_request(LsApp* app) {
     ls_link_send(app->link, "REC GET %d", app->rec_have);
     app->rec_deadline = furi_get_tick() + furi_ms_to_ticks(REC_XFER_TIMEOUT_MS);
 }
 
 static void rec_xfer_start(LsApp* app) {
+    if(app->tel.rec_phase == LsRecCapturing) {
+        toast(app, "Still capturing");
+        return;
+    }
+    rec_xfer_start_capture(app, (int)app->tel.rec_edges, app->tel.freq_hz, 0);
+}
+
+static void rec_xfer_start_capture(LsApp* app, int total, uint32_t freq_hz, uint32_t expected_span_us) {
     if(app->rec_xfer != RecXferIdle) return;
 
     if(!app->link_up) {
         toast(app, "No radio");
         return;
     }
-    if(app->tel.rec_phase == LsRecCapturing) {
-        toast(app, "Still capturing");
-        return;
-    }
-
-    int total = (int)app->tel.rec_edges;
     if(total <= 0) {
         toast(app, "Nothing captured");
         return;
     }
-    if(total > LS_REC_MAX_EDGES) total = LS_REC_MAX_EDGES;
+    if(total > LS_REC_MAX_EDGES) { toast(app, "Capture too large"); return; }
 
     rec_preview_clear(app);
     app->rec_buf = malloc(sizeof(int32_t) * (size_t)total);
@@ -742,7 +1156,8 @@ static void rec_xfer_start(LsApp* app) {
     app->rec_have = 0;
     app->rec_retries = 0;
     app->rec_view = 0;
-    app->rec_freq_hz = app->tel.freq_hz;
+    app->rec_freq_hz = freq_hz;
+    app->rec_expected_span_us = expected_span_us;
     app->rec_xfer = RecXferActive;
 
     ls_link_rec_reset(app->link);
@@ -759,14 +1174,33 @@ static void rec_xfer_cancel(LsApp* app, const char* why) {
 }
 
 static void rec_xfer_finish(LsApp* app) {
+    if(app->rec_expected_span_us) {
+        uint64_t span = 0;
+        for(int i = 0; i < app->rec_have; ++i) {
+            int64_t edge = app->rec_buf[i];
+            span += (uint64_t)(edge < 0 ? -edge : edge);
+        }
+        if(span != app->rec_expected_span_us) {
+            rec_xfer_cancel(app, "Capture data changed");
+            return;
+        }
+    }
     app->rec_xfer = RecXferIdle;
     modal_clear(app);
 
     char name[40];
-    if(app->rec_have > 0 && rec_write_sub(app, name, sizeof(name))) {
+    /*LS-526*/
+    const char* src = NULL;
+    if(app->rec_from_files && app->rec_files_sel >= 0 &&
+       app->rec_files_sel < app->rec_files_n) {
+        src = app->rec_files[app->rec_files_sel].name;
+    }
+    app->rec_from_files = false;
+
+    if(app->rec_have > 0 && rec_write_sub(app, src, name, sizeof(name))) {
         snprintf(app->rec_file, sizeof(app->rec_file), "%s", name);
-        modal_set(app, "SAVED", name, "subghz/lakeshark", 2500);
-        notification_message(app->notif, &sequence_success);
+        modal_set(app, "SAVED", name, "OK: open in SubGHz", 3000);
+        ls_alert(app, LsAlertCapture); /*LS-840*/
     } else {
         rec_preview_clear(app);
         toast(app, "Save failed");
@@ -783,11 +1217,11 @@ static void rec_xfer_tick(LsApp* app) {
     while(ls_link_rec_take(app->link, &off, &count, chunk, LS_REC_CHUNK)) {
         if((int)off != app->rec_have) continue;
 
-        if(count == 0) {
-            rec_xfer_finish(app);
+        if(count == 0 || count > app->rec_total - app->rec_have) {
+            rec_xfer_cancel(app, "Capture size changed");
             return;
         }
-        for(int i = 0; i < count && app->rec_have < app->rec_total; i++) {
+        for(int i = 0; i < count; i++) {
             app->rec_buf[app->rec_have++] = chunk[i];
         }
         app->rec_retries = 0;
@@ -861,6 +1295,25 @@ static int body_bottom(Canvas* c) {
 }
 static int body_full(Canvas* c) {
     return canvas_height(c);
+}
+
+/*LS-831  One rule for whether a stat row fits, instead of per-site guards.
+
+   draw_call and draw_adsb_stat each drew their first four rows unconditionally
+   and only guarded the rest. On the Flipper the canvas is 128x64, so
+   body_bottom is 53 and LS_ROW_H is 11: rows land at 14, 25, 36 and 47, and
+   the fourth occupies 47..57 - straight through the status-line divider at 54
+   and its text below. "BCH ok/fail" and "Preambles" were printed on top of the
+   status line.
+
+   A guard that has to be remembered at every call site is a guard that will be
+   forgotten at the next one. Returns false when the row did not fit, so a
+   caller can stop building rows it cannot show. */
+static bool stat_row(Canvas* c, int* y, const char* label, const char* value) {
+    if(*y + LS_ROW_H > body_bottom(c)) return false;
+    ls_ui_row(c, *y, label, value, false);
+    *y += LS_ROW_H;
+    return true;
 }
 
 static void draw_focus_str(
@@ -1059,8 +1512,7 @@ typedef struct {
 
 #define SERIES(field) offsetof(LsHistory, field)
 
-/**/
-
+/* What is worth tracing depends on the receiver. */
 static const LsScopeSeries SCOPE_P25[] = {
     {"SIGNAL", "%", SERIES(sig), true},
     {"BCH ERR", "%fail", SERIES(err), true},
@@ -1152,7 +1604,6 @@ static void draw_activity(Canvas* c, const LsHistory* h, int x0, int y0, int w) 
 
 static void draw_signal(Canvas* c, LsApp* app) {
     const int w = canvas_width(c);
-    /**/
     int n_scope = 0;
     const LsScopeSeries* tbl = scope_table(app, &n_scope);
     const LsScopeSeries* p = &tbl[app->focus % n_scope];
@@ -1201,8 +1652,7 @@ static void draw_call(Canvas* c, LsApp* app) {
     } else {
         snprintf(v, sizeof(v), "---");
     }
-    ls_ui_row(c, y, "NAC", v, false);
-    y += LS_ROW_H;
+    stat_row(c, &y, "NAC", v);
 
     if(t->tg_age_ms >= 0) {
         ls_ui_age(age, sizeof(age), t->tg_age_ms);
@@ -1210,8 +1660,7 @@ static void draw_call(Canvas* c, LsApp* app) {
     } else {
         snprintf(v, sizeof(v), "---");
     }
-    ls_ui_row(c, y, "TG", v, false);
-    y += LS_ROW_H;
+    stat_row(c, &y, "TG", v);
 
     if(t->src_age_ms >= 0) {
         ls_ui_age(age, sizeof(age), t->src_age_ms);
@@ -1219,32 +1668,25 @@ static void draw_call(Canvas* c, LsApp* app) {
     } else {
         snprintf(v, sizeof(v), "---");
     }
-    ls_ui_row(c, y, "SRC", v, false);
-    y += LS_ROW_H;
+    stat_row(c, &y, "SRC", v);
 
     snprintf(v, sizeof(v), "%ld/%ld", (long)t->bch_ok, (long)t->bch_fail);
-    ls_ui_row(c, y, "BCH ok/fail", v, false);
-    y += LS_ROW_H;
+    stat_row(c, &y, "BCH ok/fail", v);
 
-    if(y + LS_ROW_H <= body_bottom(c)) {
-
+    {
         const char* dmn = t->demod_name[0] ? t->demod_name :
                           (t->demod_mode >= 0 && t->demod_mode < 4) ?
                                               DEMOD_NAMES[t->demod_mode] :
                                               "-";
         snprintf(v, sizeof(v), "%s %s", dmn, t->polarity_inverted ? "INV" : "NRM");
-        ls_ui_row(c, y, "Demod", v, false);
-        y += LS_ROW_H;
+        stat_row(c, &y, "Demod", v);
     }
-    if(y + LS_ROW_H <= body_bottom(c)) {
-        snprintf(v, sizeof(v), "%s", t->ftype[0] ? t->ftype : "-");
-        ls_ui_row(c, y, "Frame", v, false);
-        y += LS_ROW_H;
-    }
-    if(y + LS_ROW_H <= body_bottom(c)) {
-        snprintf(v, sizeof(v), "%ld/%ld", (long)t->sync_count, (long)t->voice_count);
-        ls_ui_row(c, y, "Sync/Voice", v, false);
-    }
+
+    snprintf(v, sizeof(v), "%s", t->ftype[0] ? t->ftype : "-");
+    stat_row(c, &y, "Frame", v);
+
+    snprintf(v, sizeof(v), "%ld/%ld", (long)t->sync_count, (long)t->voice_count);
+    stat_row(c, &y, "Sync/Voice", v);
 
     draw_status_line(c, t->err);
 }
@@ -1416,24 +1858,105 @@ static void draw_poc(Canvas* c, LsApp* app) {
     }
 }
 
+/*LS-830  The flood tape: one pixel column per second, newest on the right.
+
+   The complaint was that pages arrive far too fast to notice - a list of the
+   last few tells you what was said and nothing about how much is coming. This
+   is a seismograph. A quiet channel is a flat line; a burst is a spike you
+   catch out of the corner of your eye without reading a word. It costs 64
+   bytes and about fifteen lines. */
+static void draw_poc_tape(Canvas* c, LsApp* app, int x, int y, int h) {
+    uint32_t now = furi_get_tick() / 1000u;
+
+    /* The tallest column in view sets the scale, so a quiet channel still
+       shows its shape instead of a row of single pixels. A floor of 2 stops
+       one page a second from filling the strip. */
+    uint8_t peak = 2;
+    for(int i = 0; i < POC_TAPE_N; i++)
+        if(app->poc_rate[i] > peak) peak = app->poc_rate[i];
+
+    for(int col = 0; col < POC_TAPE_N; col++) {
+        /* col 0 is the oldest second on screen, POC_TAPE_N-1 is this one. */
+        uint32_t sec = now - (uint32_t)(POC_TAPE_N - 1 - col);
+        uint8_t n = app->poc_rate[sec % POC_TAPE_N];
+        if(!n) continue;
+        int bar = (n * h) / peak;
+        if(bar < 1) bar = 1;
+        if(bar > h) bar = h;
+        canvas_draw_line(c, x + col, y + h - bar, x + col, y + h);
+    }
+    /* Baseline, so an idle channel reads as "listening" rather than as a
+       blank area somebody forgot to draw. */
+    canvas_draw_line(c, x, y + h, x + POC_TAPE_N - 1, y + h);
+}
+
+/*LS-830  One page, full screen. The log line gives a message 80 pixels and
+   canvas_draw_str does not wrap or clip, so anything long simply ran off the
+   right edge and was unreadable. This wraps it. */
+static void draw_poc_detail(Canvas* c, LsApp* app) {
+    if(app->focus < 0 || app->focus >= app->poc_count) {
+        app->poc_detail = false;
+        return;
+    }
+    LsPocEntry* e = &app->poc[app->focus];
+    const int w = canvas_width(c);
+
+    canvas_set_font(c, FontPrimary);
+    char head[32];
+    snprintf(head, sizeof(head), "%lu%s%s", (unsigned long)e->addr,
+             e->type[0] ? " " : "", e->type);
+    canvas_draw_str(c, 3, body_top() + 8, head);
+
+    canvas_set_font(c, FontSecondary);
+    char meta[32], age[16];
+    ls_ui_age(age, sizeof(age), (int32_t)(furi_get_tick() - e->tick));
+    snprintf(meta, sizeof(meta), "%d bd %s", e->baud, age);
+    canvas_draw_str_aligned(c, w - 3, body_top() + 8, AlignRight, AlignBottom, meta);
+    canvas_draw_line(c, 0, body_top() + 11, w - 1, body_top() + 11);
+
+    elements_text_box(c, 3, body_top() + 14, w - 6,
+                      body_full(c) - body_top() - 14, AlignLeft, AlignTop,
+                      e->text[0] ? e->text : "(no text)", false);
+}
+
 static void draw_poc_log(Canvas* c, LsApp* app) {
     canvas_set_font(c, FontSecondary);
 
+    if(app->poc_detail) {
+        draw_poc_detail(c, app);
+        return;
+    }
+
+    const int w = canvas_width(c);
+
+    /*LS-830  Status strip: how many have arrived, and the shape of the last
+       minute. Drawn whether or not anything is logged - on an empty log the
+       tape is the difference between "quiet channel" and "receiver is not
+       working", which the word "listening..." cannot tell you. */
+    {
+        char tot[24];
+        snprintf(tot, sizeof(tot), "%lu pages", (unsigned long)app->poc_total);
+        canvas_draw_str(c, 3, body_top() + 7, tot);
+        draw_poc_tape(c, app, w - POC_TAPE_N - 2, body_top(), POC_STRIP_H - 2);
+    }
+
+    const int top = body_top() + POC_STRIP_H;
+
     if(app->poc_count == 0) {
-        ls_ui_empty(c, "No pages yet", "listening...");
+        canvas_draw_str_aligned(c, w / 2, top + 14, AlignCenter, AlignTop,
+                                "No pages yet");
         return;
     }
 
     const int per = 18;
-    const int rows = (body_full(c) - body_top()) / per;
+    const int rows = (body_full(c) - top) / per;
     ls_ui_scroll(&app->list_top, app->focus, app->poc_count, rows);
 
-    const int w = canvas_width(c);
     for(int r = 0; r < rows; r++) {
         int i = app->list_top + r;
         if(i >= app->poc_count) break;
         LsPocEntry* e = &app->poc[i];
-        int y = body_top() + r * per;
+        int y = top + r * per;
         bool sel = (i == app->focus);
 
         if(sel) {
@@ -1494,14 +2017,36 @@ static void draw_traffic(Canvas* c, LsApp* app) {
         const LsAircraft* a = adsb_at(app, i);
         if(!a) break;
 
-        char label[20], value[20];
+        char label[20], value[24];
 
         if(a->call[0]) {
             snprintf(label, sizeof(label), "%s", a->call);
         } else {
             snprintf(label, sizeof(label), "%06lX", (unsigned long)a->icao);
         }
-        snprintf(value, sizeof(value), "%ldft", (long)a->altitude);
+
+        /*LS-843  Altitude alone does not say what an aircraft is doing. The
+           P4 already sends vertical rate and ground speed, and a climbing
+           departure and a descending arrival at the same 8000 ft are the
+           difference between "just took off" and "landing in five minutes" -
+           which is the whole question when you are watching a list. 300 fpm
+           is the usual level-flight deadband, below which the arrow would
+           just flicker on noise. */
+        char trend = ' ';
+        if(a->vert_rate > 300) trend = '^';
+        else if(a->vert_rate < -300) trend = 'v';
+
+        if(a->velocity > 0) {
+            snprintf(
+                value,
+                sizeof(value),
+                "%ldft%c %ldkt",
+                (long)a->altitude,
+                trend,
+                (long)a->velocity);
+        } else {
+            snprintf(value, sizeof(value), "%ldft%c", (long)a->altitude, trend);
+        }
         ls_ui_row(c, body_top() + r * LS_ROW_H, label, value, i == app->focus);
     }
     elements_scrollbar(c, app->focus, n);
@@ -1552,200 +2097,104 @@ static void draw_aircraft(Canvas* c, LsApp* app) {
     }
 }
 
-/**/
+/*LS-831  Every row bounds-checked, not just the last two.
 
-static const uint16_t COS_256[10] = {256, 252, 241, 222, 196, 165, 128, 88, 44, 0};
+   The first four rows were drawn unconditionally and only rows five and six
+   asked whether they fitted. On the Flipper the canvas is 128x64, so
+   body_bottom is 53 and LS_ROW_H is 11: rows land at 14, 25, 36 and 47, and
+   the fourth occupies 47..57 - straight through the status-line divider at
+   54 and the text baseline below it. "Preambles" and "1090.000 MHz, fixed"
+   were printed on top of each other.
 
-static uint16_t cos256_for_lat_e4(int32_t lat_e4) {
-    int32_t d = lat_e4 < 0 ? -lat_e4 : lat_e4;
-    int idx = (int)(d / 100000);
-    if(idx > 9) idx = 9;
-    return COS_256[idx];
-}
+   Build the rows first, then emit as many as fit. One rule for all of them,
+   so adding a seventh row later cannot reintroduce this. */
+/*LS-836  Shape the aircraft the link gave us into markers the renderer can
+   draw, once per tick rather than once per frame.
 
-static int adsb_positioned(LsApp* app) {
+   pos_valid is carried across deliberately: an aircraft the P4 is tracking but
+   has no CPR fix for must not be drawn, and a marker at 0,0 off West Africa is
+   how that mistake looks. The renderer already understands has_position, so
+   the check lives in one place.
+
+   1e-4 to 1e-7 degrees is a factor of a thousand - the wire is coarse because
+   11 m is finer than this screen can show, the renderer is fine because it is
+   shared with Meshtastic, which uses 1e-7 everywhere. */
+static void map_sync_aircraft(LsApp* app) {
+    LsMapRoster* r = &app->map_ctx.map_roster;
     int n = 0;
-    for(int i = 0; i < LS_AC_MAX; i++) {
-        const LsAircraft* a = &app->tel.ac[i];
-        if(a->seen && a->icao && a->pos_valid) n++;
-    }
-    return n;
-}
 
-static const LsAircraft* adsb_positioned_at(LsApp* app, int want) {
-    int n = 0;
-    for(int i = 0; i < LS_AC_MAX; i++) {
+    for(int i = 0; i < LS_AC_MAX && n < LS_MAP_MAX_PTS; i++) {
         const LsAircraft* a = &app->tel.ac[i];
-        if(!(a->seen && a->icao && a->pos_valid)) continue;
-        if(n++ == want) return a;
+        if(!a->seen) continue;
+
+        LsMapPoint* p = &r->pts[n++];
+        p->node_id = a->icao;
+        p->latitude_i = a->lat_e4 * 1000;
+        p->longitude_i = a->lon_e4 * 1000;
+        p->has_position = a->pos_valid;
+        p->has_name = a->call[0] != 0 && a->call[0] != '-';
+        snprintf(p->short_name, sizeof(p->short_name), "%s", a->call);
     }
-    return NULL;
+    r->count = (uint8_t)n;
 }
 
 static void draw_adsb_map(Canvas* c, LsApp* app) {
-    const int w = canvas_width(c);
-    int count = adsb_positioned(app);
-
-    if(count == 0) {
-        ls_ui_empty(c, "No positions yet", "needs airborne CPR pairs");
-        draw_status_line(c, "position needs 2 frames per plane");
+    if(!app->map_ready) {
+        ls_ui_empty(c, "Map unavailable", "no map.pmtiles");
         return;
     }
+    /*LS-837  DRAW ONLY. map_tick reads tiles off the SD card and decodes MVT
+       geometry, and calling it from here put all of that inside the GUI draw
+       callback - which the Flipper answers with
 
-    int32_t lat_lo = 0, lat_hi = 0, lon_lo = 0, lon_hi = 0;
-    for(int i = 0; i < count; i++) {
-        const LsAircraft* a = adsb_positioned_at(app, i);
-        if(!a) continue;
-        if(i == 0) {
-            lat_lo = lat_hi = a->lat_e4;
-            lon_lo = lon_hi = a->lon_e4;
-            continue;
-        }
-        if(a->lat_e4 < lat_lo) lat_lo = a->lat_e4;
-        if(a->lat_e4 > lat_hi) lat_hi = a->lat_e4;
-        if(a->lon_e4 < lon_lo) lon_lo = a->lon_e4;
-        if(a->lon_e4 > lon_hi) lon_hi = a->lon_e4;
-    }
+           [W][ViewPort] ViewPort lockup: see .../view_port.c:196
 
-    int32_t lat_span = lat_hi - lat_lo;
-    int32_t lon_span = lon_hi - lon_lo;
-    if(lat_span < 10) lat_span = 10;
-    if(lon_span < 10) lon_span = 10;
-
-    const int px = 4;
-    const int py = body_top() + 2;
-    const int pw = w - 8;
-    const int ph = body_full(c) - 10 - py - 2;
-    if(ph < 8) return;
-
-    canvas_draw_frame(c, px, py, pw, ph);
-    canvas_set_font(c, FontSecondary);
-    canvas_draw_str(c, px + 2, py + 8, "N");
-
-    int sel = count > 0 ? app->focus % count : 0;
-
-    for(int i = 0; i < count; i++) {
-        const LsAircraft* a = adsb_positioned_at(app, i);
-        if(!a) continue;
-
-        int x = px + 1 + (int)(((int64_t)(a->lon_e4 - lon_lo) * (pw - 3)) / lon_span);
-        int y = py + 1 + (int)(((int64_t)(lat_hi - a->lat_e4) * (ph - 3)) / lat_span);
-
-        if(i == sel) {
-            canvas_draw_circle(c, x, y, 3);
-            canvas_draw_dot(c, x, y);
-        } else {
-            canvas_draw_disc(c, x, y, 1);
-        }
-    }
-
-    const LsAircraft* s = adsb_positioned_at(app, sel);
-    char line[40];
-    if(s) {
-        char id[10];
-        if(s->call[0] && s->call[0] != '-') {
-            snprintf(id, sizeof(id), "%s", s->call);
-        } else {
-            snprintf(id, sizeof(id), "%06lX", (unsigned long)s->icao);
-        }
-        snprintf(line, sizeof(line), "%s %ldft %ldkt", id, (long)s->altitude,
-                 (long)s->velocity);
-    } else {
-        snprintf(line, sizeof(line), "%d shown", count);
-    }
-    draw_status_line(c, line);
-
-    int32_t ns_m = (lat_hi - lat_lo) * 1113 / 100;
-    int32_t ew_m = (lon_hi - lon_lo) * 1113 / 100;
-    ew_m = (int32_t)(((int64_t)ew_m * cos256_for_lat_e4((lat_hi + lat_lo) / 2)) >> 8);
-
-    char span[24];
-    snprintf(span, sizeof(span), "%ldx%ldkm", (long)(ns_m / 1000), (long)(ew_m / 1000));
-    canvas_draw_str_aligned(c, px + pw - 2, py + 8, AlignRight, AlignBottom, span);
-}
-
-/**/
-#define ADSB_STAT_ROWS 9
-/**/
-#define ADSB_ROW_TTSVOL 8
-
-static void adsb_stat_row(LsApp* app, int idx, char* label, size_t ll, char* val, size_t vl) {
-    LsTelemetry* t = &app->tel;
-    switch(idx) {
-    case 0:
-        snprintf(label, ll, "Tracked");
-        snprintf(val, vl, "%ld", (long)t->ac_tracked);
-        break;
-    case 1:
-        snprintf(label, ll, "Messages");
-        snprintf(val, vl, "%ld/s", (long)t->msgs_sec);
-        break;
-    case 2:
-        snprintf(label, ll, "Total msgs");
-        snprintf(val, vl, "%ld", (long)t->msgs_total);
-        break;
-    case 3:
-        snprintf(label, ll, "CRC ok/err");
-        snprintf(val, vl, "%ld/%ld", (long)t->crc_good, (long)t->crc_err);
-        break;
-    case 4:
-        snprintf(label, ll, "Preambles");
-        snprintf(val, vl, "%ld/s", (long)t->bursts_sec);
-        break;
-    case 5:
-        snprintf(label, ll, "Mag avg/peak");
-        snprintf(val, vl, "%ld/%ld", (long)t->mag_avg, (long)t->mag_peak);
-        break;
-    case 6:
-        snprintf(label, ll, "Last message");
-        ls_ui_age(val, vl, t->last_msg_ms);
-        break;
-    case 7:
-        snprintf(label, ll, "Gain");
-        if(t->gain_tenths <= 0) {
-            snprintf(val, vl, "auto");
-        } else {
-            snprintf(val, vl, "%ld.%ld dB", (long)(t->gain_tenths / 10),
-                     (long)(t->gain_tenths % 10));
-        }
-        break;
-    /**/
-    default:
-        snprintf(label, ll, "TTS volume");
-        snprintf(val, vl, "%ld%%", (long)echo_get(app, ECHO_TTSVOL, t->tts_vol));
-        break;
-    }
-}
-
-/**/
-static void adsb_ttsvol_adjust(LsApp* app, int delta) {
-    int32_t v = echo_get(app, ECHO_TTSVOL, app->tel.tts_vol) + delta;
-    if(v < 0) v = 0;
-    if(v > 200) v = 200;
-    ls_link_send(app->link, "TTSVOL %ld", (long)v);
-    echo_set(app, ECHO_TTSVOL, v);
+       every couple of seconds. ZeroMesh drives map_tick from its main loop and
+       so do we now. */
+    render_map(c, &app->map_ctx);
 }
 
 static void draw_adsb_stat(Canvas* c, LsApp* app) {
+    LsTelemetry* t = &app->tel;
     canvas_set_font(c, FontSecondary);
 
-    int rows = (body_full(c) - body_top()) / LS_ROW_H;
-    if(rows < 1) rows = 1;
-    if(rows > ADSB_STAT_ROWS) rows = ADSB_STAT_ROWS;
+    struct {
+        const char* label;
+        char value[24];
+    } row[6];
+    int n = 0;
 
-    ls_ui_scroll(&app->list_top, app->focus, ADSB_STAT_ROWS, rows);
+    row[n].label = "Tracked";
+    snprintf(row[n].value, sizeof(row[n].value), "%ld", (long)t->ac_tracked);
+    n++;
+
+    row[n].label = "Messages";
+    snprintf(row[n].value, sizeof(row[n].value), "%ld/s", (long)t->msgs_sec);
+    n++;
+
+    row[n].label = "CRC ok/err";
+    snprintf(row[n].value, sizeof(row[n].value), "%ld/%ld", (long)t->crc_good,
+             (long)t->crc_err);
+    n++;
+
+    row[n].label = "Preambles";
+    snprintf(row[n].value, sizeof(row[n].value), "%ld/s", (long)t->bursts_sec);
+    n++;
+
+    row[n].label = "Mag avg/peak";
+    snprintf(row[n].value, sizeof(row[n].value), "%ld/%ld", (long)t->mag_avg,
+             (long)t->mag_peak);
+    n++;
+
+    row[n].label = "Last message";
+    ls_ui_age(row[n].value, sizeof(row[n].value), t->last_msg_ms);
+    n++;
 
     int y = body_top();
-    for(int i = 0; i < rows; i++) {
-        int idx = app->list_top + i;
-        if(idx >= ADSB_STAT_ROWS) break;
-        char label[16], val[24];
-        adsb_stat_row(app, idx, label, sizeof(label), val, sizeof(val));
-        /**/
-        ls_ui_row_edit(c, y, label, val, idx == app->focus,
-                       app->editing && idx == app->focus);
-        y += LS_ROW_H;
-    }
+    for(int i = 0; i < n; i++)
+        if(!stat_row(c, &y, row[i].label, row[i].value)) break;
+
+    draw_status_line(c, "1090.000 MHz, fixed");
 }
 
 typedef enum {
@@ -1968,6 +2417,27 @@ static void draw_rec_cap(Canvas* c, LsApp* app) {
     }
 }
 
+/*LS-844  Launcher icons: 8x8 XBM, least-significant bit leftmost, generated
+   from ASCII grids so the shapes could be judged as shapes before they were
+   ever on a screen. A speaker for voice, a tower for broadcast, an envelope
+   for messages, an aircraft, the record dot, a gear. */
+static const uint8_t ICON_P25[] = {0x0C, 0x4E, 0xAF, 0xAF, 0xAF, 0x4E, 0x0C, 0x00};
+static const uint8_t ICON_FM[] = {0x18, 0x18, 0x3C, 0x24, 0x66, 0x42, 0xC3, 0x81};
+static const uint8_t ICON_POCSAG[] = {0x00, 0x7E, 0x42, 0x66, 0x5A, 0x42, 0x7E, 0x00};
+static const uint8_t ICON_ADSB[] = {0x08, 0x08, 0x08, 0x7F, 0x08, 0x08, 0x1C, 0x00};
+static const uint8_t ICON_REC[] = {0x00, 0x3C, 0x7E, 0x7E, 0x7E, 0x7E, 0x3C, 0x00};
+static const uint8_t ICON_SET[] = {0x24, 0x7E, 0x66, 0xC3, 0xC3, 0x66, 0x7E, 0x24};
+
+/* Indexed by LsRadioApp, so a new app that forgets its icon is a compile
+   error rather than a blank column. */
+static const uint8_t* const APP_ICONS[LsRadioCount] = {
+    ICON_P25,
+    ICON_FM,
+    ICON_POCSAG,
+    ICON_ADSB,
+    ICON_REC,
+};
+
 static void draw_launcher(Canvas* c, LsApp* app) {
     canvas_set_font(c, FontSecondary);
 
@@ -2011,7 +2481,13 @@ static void draw_launcher(Canvas* c, LsApp* app) {
             label = "Settings";
             value = ls_link_state_str(app->link);
         }
-        ls_ui_row(c, body_top() + r * LS_ROW_H, label, value, i == app->focus);
+        ls_ui_row_icon(
+            c,
+            body_top() + r * LS_ROW_H,
+            i < LsRadioCount ? APP_ICONS[i] : ICON_SET,
+            label,
+            value,
+            i == app->focus);
     }
     elements_scrollbar(c, app->focus, n);
 }
@@ -2275,11 +2751,17 @@ static void draw_set_link(Canvas* c, LsApp* app) {
     draw_status_line(c, hint);
 }
 
+/*LS-842  The radio's log level, remotely. esp_log's ladder, in its order,
+   so the index is the level. */
+static const char* const LOG_LEVEL_NAMES[] = {"error", "warn", "info", "debug", "verbose"};
+#define LOG_LEVEL_COUNT ((int)(sizeof(LOG_LEVEL_NAMES) / sizeof(LOG_LEVEL_NAMES[0])))
+
 typedef enum {
     DEV_UPTIME,
     DEV_MEM,
     DEV_SDR,
     DEV_SYS,
+    DEV_LOG,
     DEV_TESTSND,
     DEV_SDR_RESET,
     DEV_SDR_RECOVER,
@@ -2333,14 +2815,16 @@ static void draw_set_device(Canvas* c, LsApp* app) {
                 snprintf(v, sizeof(v), "DOWN");
             } else if(t->sdr_stall_s > 0) {
                 snprintf(v, sizeof(v), "STALL %lds", (long)t->sdr_stall_s);
-            } else if(t->rtl_health[0] && strcmp(t->rtl_health, "ok") != 0) {
-                snprintf(v, sizeof(v), "%s", t->rtl_health);
             } else {
                 snprintf(v, sizeof(v), "ready");
             }
             break;
         case DEV_SYS:
             label = "Read SYS info";
+            break;
+        case DEV_LOG:
+            label = "Radio log";
+            snprintf(v, sizeof(v), "%s", LOG_LEVEL_NAMES[app->log_level]);
             break;
         case DEV_TESTSND:
             label = "Test sound";
@@ -2426,28 +2910,117 @@ static void draw_set_display(Canvas* c, LsApp* app) {
     }
 }
 
-static void draw_set_about(Canvas* c, LsApp* app) {
+/*LS-840  Eight yes/no rows and a tone. Drawn as boxes rather than the word
+   "on" repeated eight times: the state becomes a shape, and the row that
+   differs is findable without reading every line. */
+static void draw_set_alerts(Canvas* c, LsApp* app) {
     canvas_set_font(c, FontSecondary);
 
-    char v[24];
+    const int rows = ls_ui_rows(c);
+    ls_ui_scroll(&app->list_top, app->focus, ALR_COUNT, rows);
+
+    int y = body_top();
+    for(int i = app->list_top; i < ALR_COUNT && i < app->list_top + rows; i++) {
+        const bool sel = app->focus == i;
+        const int k = alr_kind(i);
+
+        if(k >= 0) {
+            ls_ui_row_check(c, y, ALR_LABELS[i], app->alerts.on[k], sel);
+        } else if(i == ALR_LED) {
+            ls_ui_row_check(c, y, ALR_LABELS[i], app->alerts.led, sel);
+        } else if(i == ALR_VIBRO) {
+            ls_ui_row_check(c, y, ALR_LABELS[i], app->alerts.vibro, sel);
+        } else if(i == ALR_TONE) {
+            char v[RINGTONE_NAME_MAX];
+            ringtone_label(&app->alerts, app->alerts.ringtone, v, sizeof(v));
+            ls_ui_row_edit(c, y, ALR_LABELS[i], v, sel, app->editing && sel);
+        } else {
+            ls_ui_row(c, y, ALR_LABELS[i], "OK", sel);
+        }
+        y += LS_ROW_H;
+    }
+
+    elements_scrollbar(c, app->focus, ALR_COUNT);
+}
+
+/*LS-841  What is at the other end of the link.
+
+   This page used to answer questions the rest of the app already answers -
+   mode, transport and frame count are on VFO, LINK and DIAG. The question
+   only this page can answer is which firmware the radio is running, and it
+   was the one thing missing: the P4 has always had a VER command and the head
+   never sent it, so an operator with the radio in another room had no way to
+   tell a current build from one six months old.
+
+   Laid out as an identity block rather than a row list, because that is what
+   it is: who this is, then what it is talking to. */
+static void draw_set_about(Canvas* c, LsApp* app) {
+    const int w = canvas_width(c);
     int y = body_top();
 
-    ls_ui_row(c, y, "Radio", app->tel.mode_name[0] ? app->tel.mode_name : "-", false);
-    y += LS_ROW_H;
-    ls_ui_row(c, y, "Transport", ls_link_port_name(app->link), false);
-    y += LS_ROW_H;
-    uint32_t frames = 0;
-    ls_link_stats(app->link, &frames, NULL, NULL);
-    snprintf(v, sizeof(v), "%lu", (unsigned long)frames);
-    ls_ui_row(c, y, "Frames", v, false);
+    canvas_set_font(c, FontPrimary);
+    canvas_draw_str(c, 3, y + 9, "LakeShark");
+    canvas_set_font(c, FontSecondary);
+    canvas_draw_str_aligned(c, w - 3, y + 9, AlignRight, AlignBottom, LS_HEAD_VERSION);
+    y += 11;
+    canvas_draw_line(c, 0, y, w - 1, y);
+    y += 2;
+
+    char ver[96];
+    ls_link_radio_version(app->link, ver, sizeof(ver));
+
+    if(ver[0]) {
+        /* "LakeShark_1.0.1-g8cc5b7beda55-dirty_[DIRTY]_board_ESP32-P4-..._built_..."
+           Board and build time are another sixty characters that will not fit
+           on a row and answer nothing this page is for. Keep the release, keep
+           enough of the hash to find the build again, and keep whether it came
+           from a dirty tree - that last one is the difference between a build
+           you can check out and one that only ever existed on someone's
+           bench. */
+        /* Cut the token out at full length first. Trimming into the display
+           buffer as we go loses the "-dirty" suffix off the end before there
+           is a chance to notice it, and a dirty build that renders as a clean
+           one is the one mistake this row must not make. */
+        char tok[48];
+        size_t n = 0;
+        const char* p = ver + 10; /* past "LakeShark" and its separator */
+        while(p[n] && p[n] != '_' && p[n] != ' ' && n < sizeof(tok) - 1) n++;
+        memcpy(tok, p, n);
+        tok[n] = '\0';
+
+        bool dirty = false;
+        char* tail = strstr(tok, "-dirty");
+        if(tail) {
+            *tail = '\0';
+            dirty = true;
+        }
+        /* Trim the git hash to the eight characters people actually type. */
+        char* g = strstr(tok, "-g");
+        if(g && strlen(g) > 10) g[10] = '\0';
+        if(dirty) strlcat(tok, "*", sizeof(tok));
+
+        char shown[24];
+        strlcpy(shown, tok, sizeof(shown));
+
+        canvas_draw_str(c, 3, y + 8, "Radio fw");
+        canvas_draw_str_aligned(c, w - 3, y + 8, AlignRight, AlignBottom, shown);
+    } else {
+        canvas_draw_str(c, 3, y + 8, "Radio fw");
+        canvas_draw_str_aligned(
+            c, w - 3, y + 8, AlignRight, AlignBottom, app->link_up ? "asking..." : "no link");
+    }
     y += LS_ROW_H;
 
-    snprintf(v, sizeof(v), "%d Hz", app->cfg.tel_hz);
-    ls_ui_row(c, y, "Telemetry", v, false);
+    char v[24];
+    uint32_t frames = 0;
+    ls_link_stats(app->link, &frames, NULL, NULL);
+    snprintf(v, sizeof(v), "%s %lu fr", ls_link_port_name(app->link), (unsigned long)frames);
+    ls_ui_row(c, y, "Link", v, false);
     y += LS_ROW_H;
+
     if(y + LS_ROW_H <= body_full(c)) {
-        snprintf(v, sizeof(v), "%d", app->mem_count);
-        ls_ui_row(c, y, "Memories", v, false);
+        snprintf(v, sizeof(v), "%d Hz / %d mem", app->cfg.tel_hz, app->mem_count);
+        ls_ui_row(c, y, "Telemetry", v, false);
     }
 }
 
@@ -2493,6 +3066,212 @@ static uint32_t edit_value(LsApp* app) {
     return (uint32_t)strtoul(app->edit, NULL, 10);
 }
 
+
+/*LS-526*/
+static void draw_rec_files(Canvas* c, LsApp* app) {
+    if(app->rec_files_busy && app->rec_files_n == 0) {
+        ls_ui_empty(c, "Reading board...", "");
+        return;
+    }
+    if(app->rec_files_n <= 0) {
+        ls_ui_empty(c, "No saved captures", "OK to refresh");
+        return;
+    }
+
+    int rows = ls_ui_rows(c);
+    ls_ui_scroll(&app->rec_files_top, app->rec_files_sel, app->rec_files_n, rows);
+
+    int y = body_top();
+    for(int i = app->rec_files_top; i < app->rec_files_n && i < app->rec_files_top + rows;
+        i++) {
+        const RecFileEntry* e = &app->rec_files[i];
+        char mhz[16];
+        ls_ui_mhz(mhz, sizeof(mhz), e->freq_hz);
+        ls_ui_row(c, y, e->name, mhz, i == app->rec_files_sel);
+        y += LS_ROW_H;
+    }
+}
+
+/* P25 SYSTEM. PSYS every two seconds while the page is up, and the card's
+   profiles walked one PROF row per round trip, the same pump as REC LS.
+   Rows: follow, three read-only lines, then the profiles. */
+#define PSYS_PERIOD_MS 2000
+#define PROF_TIMEOUT_MS 800
+#define SYS_INFO_ROWS 4
+
+static void prof_request(LsApp* app, int index) {
+    app->prof_want = index;
+    ls_link_send(app->link, "PROF %d", index);
+    app->prof_deadline = furi_get_tick() + furi_ms_to_ticks(PROF_TIMEOUT_MS);
+}
+
+static void prof_refresh(LsApp* app) {
+    app->prof_n = 0;
+    app->prof_retries = 0;
+    app->prof_busy = true;
+    prof_request(app, 0);
+}
+
+static void psys_request_soon(LsApp* app, uint32_t ms) {
+    app->psys_next = furi_get_tick() + furi_ms_to_ticks(ms);
+}
+
+static void p25_sys_tick(LsApp* app) {
+    const bool on_page = app->screen == LsScreenApp && cur_page(app) == PG_P25_SYS;
+    if(!on_page) {
+        app->sys_active = false;
+        return;
+    }
+    if(!app->link_up) return;
+    if(!app->sys_active) {
+        app->sys_active = true;
+        app->psys_asked = 0;
+        app->psys_next = 0;
+        prof_refresh(app);
+    }
+
+    LsPsys s;
+    uint32_t seq = ls_link_psys(app->link, &s);
+    if(seq != app->psys_seq) {
+        app->psys_seq = seq;
+        app->psys = s;
+        app->psys_known = true;
+    }
+    if(furi_get_tick() >= app->psys_next) {
+        ls_link_send(app->link, "PSYS");
+        app->psys_asked++;
+        psys_request_soon(app, PSYS_PERIOD_MS);
+    }
+
+    if(!app->prof_busy) return;
+    LsProfRow row;
+    if(ls_link_prof_take(app->link, &row)) {
+        if(row.total <= 0 || row.name[0] == '\0') {
+            app->prof_busy = false;
+            return;
+        }
+        if(row.index == app->prof_want && app->prof_n < PROF_MAX) {
+            strncpy(app->prof_name[app->prof_n], row.name, LS_PSYS_TEXT - 1);
+            app->prof_name[app->prof_n][LS_PSYS_TEXT - 1] = '\0';
+            strncpy(app->prof_system[app->prof_n], row.system, LS_PSYS_TEXT - 1);
+            app->prof_system[app->prof_n][LS_PSYS_TEXT - 1] = '\0';
+            app->prof_n++;
+        }
+        app->prof_retries = 0;
+        if(app->prof_n < row.total && app->prof_n < PROF_MAX)
+            prof_request(app, app->prof_n);
+        else
+            app->prof_busy = false;
+        return;
+    }
+    if(furi_get_tick() > app->prof_deadline) {
+        if(++app->prof_retries > 4) {
+            app->prof_busy = false;
+            return;
+        }
+        prof_request(app, app->prof_want);
+    }
+}
+
+/* "p25_profile_seabrook.txt" -> "seabrook". */
+static const char* prof_short(const char* name, char* out, size_t cap) {
+    const char* p = name;
+    if(!strncmp(p, "p25_profile", 11)) p += 11;
+    if(*p == '_' || *p == '-') p++;
+    snprintf(out, cap, "%s", *p ? p : name);
+    char* dot = strrchr(out, '.');
+    if(dot && !strcmp(dot, ".txt")) *dot = '\0';
+    if(!out[0]) snprintf(out, cap, "default");
+    return out;
+}
+
+static void draw_p25_sys(Canvas* c, LsApp* app) {
+    if(!app->link_up) {
+        ls_ui_empty(c, "No radio", "");
+        return;
+    }
+    if(!app->psys_known) {
+        if(app->psys_asked > 3)
+            ls_ui_empty(c, "Radio too old", "Update LakeShark");
+        else
+            ls_ui_empty(c, "Asking radio...", "");
+        return;
+    }
+
+    const LsPsys* s = &app->psys;
+    const int n = SYS_INFO_ROWS + app->prof_n;
+    const int rows = ls_ui_rows(c);
+    app->focus = clampi(app->focus, 0, n - 1);
+    ls_ui_scroll(&app->prof_top, app->focus, n, rows);
+
+    int y = body_top();
+    for(int i = app->prof_top; i < n && i < app->prof_top + rows; i++) {
+        char v[40], shortname[LS_PSYS_TEXT];
+        const bool sel = i == app->focus;
+        switch(i) {
+        case 0:
+            if(s->p2_follow)
+                snprintf(v, sizeof(v), "ON  %lu gr", (unsigned long)s->p2_grants);
+            else
+                snprintf(v, sizeof(v), "OFF");
+            ls_ui_row(c, y, "PH2 FOLLOW", v, sel);
+            break;
+        case 1:
+            ls_ui_row(c, y, "SYSTEM", s->system[0] ? s->system : "none", sel);
+            break;
+        case 2:
+            ls_ui_row(c, y, "SITE GPS", s->geo[0] ? s->geo : "-", sel);
+            break;
+        case 3:
+            if(s->held)
+                snprintf(v, sizeof(v), "%lu  %03X", (unsigned long)s->held, s->held_nac);
+            else
+                snprintf(v, sizeof(v), "0");
+            ls_ui_row(c, y, "NOISE HELD", v, sel);
+            break;
+        default: {
+            const int k = i - SYS_INFO_ROWS;
+            const bool loaded = !strcmp(app->prof_name[k], s->profile);
+            ls_ui_row(
+                c,
+                y,
+                prof_short(app->prof_name[k], shortname, sizeof(shortname)),
+                loaded ? "LOADED" : app->prof_system[k],
+                sel);
+            break;
+        }
+        }
+        y += LS_ROW_H;
+    }
+    if(app->prof_busy && app->prof_n == 0 && app->prof_top + rows > SYS_INFO_ROWS)
+        ls_ui_row(c, body_top() + (SYS_INFO_ROWS - app->prof_top) * LS_ROW_H,
+                  "Reading card...", "", false);
+}
+
+static void p25_sys_input(LsApp* app, bool up, bool down, bool ok, bool ok_long) {
+    const int n = SYS_INFO_ROWS + app->prof_n;
+    if(up && app->focus > 0) app->focus--;
+    if(down && app->focus < n - 1) app->focus++;
+    if(ok_long) {
+        prof_refresh(app);
+        toast(app, "Reading card");
+        return;
+    }
+    if(!ok || !app->link_up) return;
+    if(app->focus == 0) {
+        const bool on = !app->psys.p2_follow;
+        ls_link_send(app->link, "P2 FOLLOW %s", on ? "on" : "off");
+        toast(app, on ? "Phase II follow on" : "Phase II follow off");
+        psys_request_soon(app, 300);
+    } else if(app->focus >= SYS_INFO_ROWS) {
+        const int k = app->focus - SYS_INFO_ROWS;
+        char shortname[LS_PSYS_TEXT];
+        ls_link_send(app->link, "PROF LOAD %s", app->prof_name[k]);
+        toast(app, "Loading %s", prof_short(app->prof_name[k], shortname, sizeof(shortname)));
+        psys_request_soon(app, 1500);
+    }
+}
+
 static const char* page_title(LsApp* app) {
     switch(cur_page(app)) {
     case PG_VFO:
@@ -2517,7 +3296,6 @@ static const char* page_title(LsApp* app) {
         return "AIRCRAFT";
     case PG_ADSB_STAT:
         return "STATS";
-    /**/
     case PG_ADSB_MAP:
         return "MAP";
     case PG_REC:
@@ -2526,6 +3304,11 @@ static const char* page_title(LsApp* app) {
         return "SIGNAL";
     case PG_REC_CAP:
         return "CAPTURE";
+    /*LS-526*/
+    case PG_REC_FILES:
+        return "FILES";
+    case PG_P25_SYS:
+        return "SYSTEM";
     }
     return "?";
 }
@@ -2562,12 +3345,11 @@ static void draw_app_page(Canvas* c, LsApp* app) {
     case PG_AIRCRAFT:
         draw_aircraft(c, app);
         break;
-    case PG_ADSB_STAT:
-        draw_adsb_stat(c, app);
-        break;
-    /**/
     case PG_ADSB_MAP:
         draw_adsb_map(c, app);
+        break;
+    case PG_ADSB_STAT:
+        draw_adsb_stat(c, app);
         break;
     case PG_REC:
         draw_rec(c, app);
@@ -2577,6 +3359,13 @@ static void draw_app_page(Canvas* c, LsApp* app) {
         break;
     case PG_REC_CAP:
         draw_rec_cap(c, app);
+        break;
+    /*LS-526*/
+    case PG_REC_FILES:
+        draw_rec_files(c, app);
+        break;
+    case PG_P25_SYS:
+        draw_p25_sys(c, app);
         break;
     }
 }
@@ -2597,6 +3386,9 @@ static void draw_settings_page(Canvas* c, LsApp* app) {
         break;
     case SET_DISPLAY:
         draw_set_display(c, app);
+        break;
+    case SET_ALERTS:
+        draw_set_alerts(c, app);
         break;
     case SET_ABOUT:
         draw_set_about(c, app);
@@ -2891,6 +3683,15 @@ static void device_action(LsApp* app, int row) {
         ls_link_send(app->link, "SYS");
         toast(app, "SYS requested");
         break;
+    case DEV_LOG:
+        /*LS-842  Turning the radio's logging up is the first thing you want
+           when it misbehaves, and the whole point of this head is that the
+           radio is not in reach. Cycles on OK rather than opening an editor:
+           five values, and you almost always want the next one up. */
+        app->log_level = (app->log_level + 1) % LOG_LEVEL_COUNT;
+        ls_link_send(app->link, "LOG * %s", LOG_LEVEL_NAMES[app->log_level]);
+        toast(app, "Log %s", LOG_LEVEL_NAMES[app->log_level]);
+        break;
     case DEV_TESTSND:
         ls_link_send(app->link, "BEEP NOW");
         toast(app, "Test sound sent");
@@ -2943,6 +3744,10 @@ static bool settings_row_is_value(LsApp* app) {
         return app->focus == LNK_TEL;
     case SET_DISPLAY:
         return app->focus >= 0 && app->focus < DSP_COUNT;
+    case SET_ALERTS:
+        /* Only the tone is a value to scroll through; the rest toggle on OK,
+           which is the gesture a checkbox asks for. */
+        return app->focus == ALR_TONE;
     default:
 
         return false;
@@ -2968,6 +3773,16 @@ static void settings_adjust(LsApp* app, int dir) {
             app->cfg.tel_hz = hz;
             ls_link_send(app->link, "TEL %d", app->cfg.tel_hz);
             ls_cfg_save(&app->cfg);
+        }
+        break;
+
+    case SET_ALERTS:
+        if(app->focus == ALR_TONE) {
+            int n = (int)ringtone_total(&app->alerts);
+            if(n > 0) {
+                app->alerts.ringtone = (uint16_t)(((int)app->alerts.ringtone + dir + n) % n);
+                alerts_to_cfg(app);
+            }
         }
         break;
 
@@ -3049,22 +3864,6 @@ static void handle_app(LsApp* app, InputEvent* ev, bool press) {
         if(handled) return;
     }
 
-    /**/
-    if(pg == PG_ADSB_STAT && app->editing) {
-        bool handled = true;
-        if(press && (ev->key == InputKeyUp || ev->key == InputKeyRight)) {
-            adsb_ttsvol_adjust(app, +10);
-        } else if(press && (ev->key == InputKeyDown || ev->key == InputKeyLeft)) {
-            adsb_ttsvol_adjust(app, -10);
-        } else if(
-            ev->type == InputTypeShort && (ev->key == InputKeyOk || ev->key == InputKeyBack)) {
-            app->editing = false;
-        } else {
-            handled = false;
-        }
-        if(handled) return;
-    }
-
     if(pg == PG_REC && app->editing) {
         bool handled = true;
         if(press && (ev->key == InputKeyUp || ev->key == InputKeyRight)) {
@@ -3083,6 +3882,18 @@ static void handle_app(LsApp* app, InputEvent* ev, bool press) {
         if(handled) return;
     }
 
+    /*LS-836  The map wants the D-pad for panning and zooming, and the page
+       strip wants Left and Right for itself. map_wants_key is the renderer
+       saying which ones it is actually using right now - it releases them when
+       it is not panning, so the page strip still works from the map screen.
+       Placed before the page handlers because whoever is using a key has to be
+       asked before the key is spent. */
+    if(cur_page(app) == PG_ADSB_MAP && app->map_ready &&
+       map_wants_key(&app->map_ctx, ev->key)) {
+        input_map(ev, &app->map_ctx);
+        return;
+    }
+
     if(press && ev->key == InputKeyRight) {
         app->page = (app->page + 1) % d->n_pages;
         app->focus = 0;
@@ -3095,6 +3906,13 @@ static void handle_app(LsApp* app, InputEvent* ev, bool press) {
         app->focus = 0;
         app->list_top = 0;
         app->editing = false;
+        return;
+    }
+    /*LS-830  Back closes the page detail before it leaves the app. Without
+       this, opening a page and pressing Back drops the operator all the way
+       out to the launcher, which is not what Back means anywhere else. */
+    if(ev->type == InputTypeShort && ev->key == InputKeyBack && app->poc_detail) {
+        app->poc_detail = false;
         return;
     }
     if(ev->type == InputTypeShort && ev->key == InputKeyBack) {
@@ -3111,6 +3929,11 @@ static void handle_app(LsApp* app, InputEvent* ev, bool press) {
     const bool ok_long = ev->type == InputTypeLong && ev->key == InputKeyOk;
 
     switch(pg) {
+    /*LS-836  Anything the map did not claim above falls through to nothing;
+       the page strip and Back have already had their say. */
+    case PG_ADSB_MAP:
+        break;
+
     case PG_VFO: {
         uint8_t rows[VFO_ROW_MAX];
         const int nrows = vfo_rows(app, rows);
@@ -3133,7 +3956,6 @@ static void handle_app(LsApp* app, InputEvent* ev, bool press) {
 
         if(up) ls_link_send(app->link, "TUNE %ld", (long)STEPS[app->cfg.step_idx]);
         if(down) ls_link_send(app->link, "TUNE -%ld", (long)STEPS[app->cfg.step_idx]);
-        /**/
         if(ok) {
             int n_scope = 0;
             scope_table(app, &n_scope);
@@ -3246,11 +4068,19 @@ static void handle_app(LsApp* app, InputEvent* ev, bool press) {
         break;
 
     case PG_POC_LOG:
+        /*LS-830  In the detail view the only thing the D-pad should do is
+           walk to the next page, so a flood can be read one at a time without
+           bouncing back to the list for each one. */
         if(up && app->poc_count) app->focus = (app->focus + app->poc_count - 1) % app->poc_count;
         if(down && app->poc_count) app->focus = (app->focus + 1) % app->poc_count;
+        if(ok && app->poc_count && !app->poc_detail) {
+            app->poc_detail = true;
+            break;
+        }
         if(ok_long) {
             app->poc_count = 0;
             app->focus = 0;
+            app->poc_detail = false;
             app->poc_last_addr = 0;
             app->poc_last_text[0] = '\0';
             toast(app, "Log cleared");
@@ -3273,31 +4103,10 @@ static void handle_app(LsApp* app, InputEvent* ev, bool press) {
         break;
     }
 
-    /**/
-    case PG_ADSB_MAP: {
-        int n = adsb_positioned(app);
-        if(n > 0) {
-            if(up) app->focus = (app->focus + n - 1) % n;
-            if(down) app->focus = (app->focus + 1) % n;
-        }
-        break;
-    }
-
-    /**/
     case PG_ADSB_STAT:
-        if(up) app->focus = (app->focus + ADSB_STAT_ROWS - 1) % ADSB_STAT_ROWS;
-        if(down) app->focus = (app->focus + 1) % ADSB_STAT_ROWS;
-        /**/
-        if(ok && app->focus == ADSB_ROW_TTSVOL) app->editing = true;
         if(ok_long) {
-            if(app->focus == ADSB_ROW_TTSVOL) {
-                ls_link_send(app->link, "TTSVOL 100");
-                echo_set(app, ECHO_TTSVOL, 100);
-                toast(app, "TTS volume 100%");
-            } else {
-                ls_link_send(app->link, "GAIN AUTO");
-                toast(app, "Gain -> auto");
-            }
+            ls_link_send(app->link, "GAIN AUTO");
+            toast(app, "Gain -> auto");
         }
         break;
 
@@ -3346,6 +4155,23 @@ static void handle_app(LsApp* app, InputEvent* ev, bool press) {
             rec_preview_clear(app);
             toast(app, "Preview cleared");
         }
+        break;
+    /*LS-526*/
+    case PG_REC_FILES:
+        if(ok) {
+            if(app->rec_files_n <= 0)
+                rec_files_refresh(app);
+            else
+                rec_files_load_selected(app);
+        }
+        /* Long OK is the shortcut the SubGHz browse was making painful: it
+           hands the last file this app wrote straight to the stock app. */
+        if(ok_long) rec_open_in_subghz(app);
+        if(up && app->rec_files_sel > 0) app->rec_files_sel--;
+        if(down && app->rec_files_sel < app->rec_files_n - 1) app->rec_files_sel++;
+        break;
+    case PG_P25_SYS:
+        p25_sys_input(app, up, down, ok, ok_long);
         break;
     }
 
@@ -3422,6 +4248,10 @@ static void handle_settings(LsApp* app, InputEvent* ev, bool press) {
         if(up) app->focus = (app->focus + DSP_COUNT - 1) % DSP_COUNT;
         if(down) app->focus = (app->focus + 1) % DSP_COUNT;
         break;
+    case SET_ALERTS:
+        if(up) app->focus = (app->focus + ALR_COUNT - 1) % ALR_COUNT;
+        if(down) app->focus = (app->focus + 1) % ALR_COUNT;
+        break;
     case SET_ABOUT:
     default:
         break;
@@ -3450,6 +4280,23 @@ static void handle_settings(LsApp* app, InputEvent* ev, bool press) {
                 break;
             default:
                 break;
+            }
+        } else if(app->set_page == SET_ALERTS) {
+            int k = alr_kind(app->focus);
+            if(k >= 0) {
+                app->alerts.on[k] = !app->alerts.on[k];
+                alerts_to_cfg(app);
+            } else if(app->focus == ALR_LED) {
+                app->alerts.led = !app->alerts.led;
+                alerts_to_cfg(app);
+            } else if(app->focus == ALR_VIBRO) {
+                app->alerts.vibro = !app->alerts.vibro;
+                alerts_to_cfg(app);
+            } else if(app->focus == ALR_TEST) {
+                /*LS-840  Straight to the worker, past both gates: a test the
+                   rate limiter can swallow is a test that teaches nothing. */
+                app->alert_next = 0;
+                furi_semaphore_release(app->alert_sig);
             }
         } else if(app->set_page == SET_DEVICE) {
             device_action(app, app->focus);
@@ -3526,6 +4373,9 @@ int32_t lakeshark_p25_app(void* p) {
     memset(app, 0, sizeof(LsApp));
     app->running = true;
     app->screen = LsScreenLauncher;
+    /*LS-526*/
+    app->rec_load_idx = -1;
+    app->rec_files_sel = 0;
     app->pending_transport = -1;
 
     app->lock = furi_mutex_alloc(FuriMutexTypeNormal);
@@ -3548,6 +4398,30 @@ int32_t lakeshark_p25_app(void* p) {
     gui_add_view_port(app->gui, app->vp, GuiLayerFullscreen);
 
     apply_orientation(app);
+
+    /*LS-836  The map shares the app's mutex; render_map runs on the GUI
+       thread while map_tick may fetch a tile from the SD card. */
+    /*LS-842  Start where the firmware starts. There is no telemetry field
+       for the log level, so this is a belief, not a reading - but a wrong
+       belief that says "info" is far less confusing than one that says
+       "error" while the radio is plainly logging at info. */
+    app->log_level = 2; /* info */
+
+    /*LS-840  Alerts up before the link is, so a link-up alert can fire. */
+    atomic_init(&app->alert_generation, 0);
+    atomic_init(&app->alert_run, false);
+    alerts_from_cfg(app);
+    ringtones_scan(&app->alerts);
+    app->alert_sig = furi_semaphore_alloc(1, 0);
+    app->alert_run = true;
+    app->alert_thr = furi_thread_alloc_ex("LsAlert", 2048, alert_worker, app);
+    furi_thread_start(app->alert_thr);
+
+    app->map_ctx.lock = app->lock;
+    app->map_ready = map_alloc(&app->map_ctx);
+    if(!app->map_ready) {
+        FURI_LOG_W("LsApp", "map unavailable - no map.pmtiles on the card");
+    }
 
     app->link = ls_link_alloc(LS_LINK_BAUD_DEFAULT);
     ls_link_send(app->link, "PING");
@@ -3611,11 +4485,36 @@ int32_t lakeshark_p25_app(void* p) {
         bool had = app->have_tel;
         app->have_tel = ls_link_get(app->link, &app->tel);
         app->link_up = ls_link_is_up(app->link);
-        if(!had && app->have_tel) toast(app, "Linked to LakeShark");
+        if(!had && app->have_tel) {
+            toast(app, "Linked to LakeShark");
+            /*LS-841  Ask once per link. A radio that reboots behind our back
+               comes back as a fresh have_tel edge, so the version cannot go
+               stale without being asked again. */
+            ls_link_send(app->link, "VER");
+            ls_alert(app, LsAlertLink); /*LS-840*/
+        }
 
         if(app->have_tel) poc_ingest(app);
 
+        /*LS-840  Traffic appearing, counted rather than tracked per ICAO: the
+           question an alert can usefully answer here is "is anything up
+           there", not "which one". Off by default - see ls_cfg_defaults. */
+        if(app->have_tel) {
+            int ac_now = adsb_visible(app);
+            if(ac_now > app->alert_prev_ac) ls_alert(app, LsAlertAircraft);
+            app->alert_prev_ac = ac_now;
+        }
+
         rec_xfer_tick(app);
+        /*LS-526*/
+        rec_files_tick(app);
+        p25_sys_tick(app);
+        rec_files_load_tick(app);
+
+        /*LS-838  Marker sync only. map_tick is called AFTER the mutex is
+           released - see below. */
+        const bool map_live = app->map_ready && cur_page(app) == PG_ADSB_MAP;
+        if(map_live) map_sync_aircraft(app);
 
         uint32_t frames = 0;
         ls_link_stats(app->link, &frames, NULL, NULL);
@@ -3670,7 +4569,10 @@ int32_t lakeshark_p25_app(void* p) {
 
         bool voice = app->link_up && app->tel.voice_active;
         if(voice && !app->prev_voice) {
-            notification_message(app->notif, &sequence_blink_blue_10);
+            /*LS-840  Speech starting is the moment worth catching on P25;
+               control traffic never stops, and alerting on it would be noise. */
+            ls_alert(app, LsAlertVoice);
+            /* LED feedback is emitted only by the configured alert dispatcher. */
             if(app->cfg.rx_wake) {
 
                 notification_message(app->notif, &sequence_display_backlight_on);
@@ -3679,20 +4581,35 @@ int32_t lakeshark_p25_app(void* p) {
         }
         app->prev_voice = voice;
 
-        bool health_bad = app->tel.rtl_health[0] && strcmp(app->tel.rtl_health, "ok") != 0 &&
-                          strcmp(app->tel.rtl_health, "settling") != 0;
         bool sdr_bad = app->link_up && app->have_tel &&
-                       (!app->tel.rtl_ready || app->tel.sdr_stall_s > 0 || health_bad);
+                       (!app->tel.rtl_ready || app->tel.sdr_stall_s > 0);
         if(sdr_bad && !app->prev_sdr_bad) {
-            notification_message(app->notif, &sequence_error);
+            /* Receiver health feedback uses the configured tone/vibration,
+               including Off. Stock error/success sequences bypassed them. */
+            ls_alert_feedback(app);
             toast(app, app->tel.rtl_ready ? "SDR stalled - recovering" : "SDR lost - recovering");
         } else if(!sdr_bad && app->prev_sdr_bad) {
-            notification_message(app->notif, &sequence_success);
+            ls_alert_feedback(app);
             toast(app, "SDR recovered");
         }
         app->prev_sdr_bad = sdr_bad;
 
         furi_mutex_release(app->lock);
+
+        /*LS-838  map_tick OUTSIDE the lock, and this is not a style choice.
+
+           app->lock is FuriMutexTypeNormal, which is not recursive, and
+           map_tick acquires it itself (ls_map.c). Calling it from inside this
+           loop's locked region deadlocked the app against itself: the main
+           thread blocked waiting for a mutex it already held, the GUI thread
+           then blocked in draw_cb waiting for the same one, and the whole app
+           froze the moment the page strip reached the map. The link thread
+           does not need the lock to parse, so telemetry kept arriving in the
+           log the entire time and made it look alive.
+
+           LS-837 moved this out of the draw callback and was right to; it
+           just landed on the wrong side of the mutex. */
+        if(map_live) map_tick(&app->map_ctx);
 
         if(app->pending_transport >= 0) {
             LsTransport want = (LsTransport)app->pending_transport;
@@ -3736,11 +4653,24 @@ int32_t lakeshark_p25_app(void* p) {
     }
 
     ls_cfg_save(&app->cfg);
-    ls_link_free(app->link);
-    rec_preview_clear(app);
+    /*LS-840  Stop before the map, and release the semaphore so the worker
+       wakes immediately instead of sitting out its 200 ms timeout. */
+    app->alert_run = false;
+    atomic_fetch_add(&app->alert_generation, 1);
+    furi_semaphore_release(app->alert_sig);
+    furi_thread_join(app->alert_thr);
+    furi_thread_free(app->alert_thr);
+    furi_semaphore_free(app->alert_sig);
 
+    /* gui_remove_view_port holds the GUI lock, waiting for any in-flight
+       draw/input callback. Detach before freeing objects those callbacks use. */
     gui_remove_view_port(app->gui, app->vp);
     view_port_free(app->vp);
+    app->vp = NULL;
+
+    if(app->map_ready) map_free(&app->map_ctx);
+    ls_link_free(app->link);
+    rec_preview_clear(app);
     furi_record_close(RECORD_GUI);
     furi_record_close(RECORD_NOTIFICATION);
     furi_message_queue_free(app->queue);

@@ -37,6 +37,16 @@ void ls_cfg_defaults(LsCfg* cfg) {
     cfg->ble_proven = false;
 
     cfg->rx_wake = true;
+
+    /*LS-840  Defaults chosen so the alerts stay worth noticing. Pages, voice
+       and finished captures are events; aircraft are weather - in a busy
+       corridor an alert per contact fires continuously, and an alert that
+       always fires is one nobody reads. Sound off, buzz on: what actually
+       works for a receiver in a pocket. */
+    cfg->alert_led = true;
+    cfg->alert_vibro = true;
+    cfg->alert_tone = 0;
+    cfg->alert_mask = 0x01 | 0x02 | 0x08; /* page | voice | capture */
 }
 
 void ls_cfg_load(LsCfg* cfg) {
@@ -61,6 +71,14 @@ void ls_cfg_load(LsCfg* cfg) {
                 cfg->tel_hz = v;
             } else if(sscanf(s, "rxwake=%d", &v) == 1) {
                 cfg->rx_wake = (v != 0);
+            } else if(sscanf(s, "aled=%d", &v) == 1) {
+                cfg->alert_led = (v != 0);
+            } else if(sscanf(s, "avib=%d", &v) == 1) {
+                cfg->alert_vibro = (v != 0);
+            } else if(sscanf(s, "atone=%d", &v) == 1 && v >= 0 && v < 256) {
+                cfg->alert_tone = v;
+            } else if(sscanf(s, "amask=%d", &v) == 1 && v >= 0 && v < 256) {
+                cfg->alert_mask = (uint8_t)v;
             } else if(sscanf(s, "ble=%d", &v) == 1) {
 
                 cfg->want_ble = (v != 0);
@@ -88,13 +106,22 @@ void ls_cfg_save(const LsCfg* cfg) {
             "step=%d\n"
             "tel=%d\n"
             "rxwake=%d\n"
-            "ble=%d\n",
+            "ble=%d\n"
+            "# alerts: mask bits are page|voice|aircraft|capture|link\n"
+            "aled=%d\n"
+            "avib=%d\n"
+            "atone=%d\n"
+            "amask=%d\n",
             (int)cfg->boot_app,
             (int)cfg->orient,
             cfg->step_idx,
             cfg->tel_hz,
             cfg->rx_wake ? 1 : 0,
-            cfg->want_ble ? 1 : 0);
+            cfg->want_ble ? 1 : 0,
+            cfg->alert_led ? 1 : 0,
+            cfg->alert_vibro ? 1 : 0,
+            cfg->alert_tone,
+            (int)cfg->alert_mask);
         stream_write_string(stream, s);
         furi_string_free(s);
     }

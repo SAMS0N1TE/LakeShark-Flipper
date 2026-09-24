@@ -188,8 +188,22 @@ static void ls_profile_get_gap_config(GapConfig* config, FuriHalBleProfileParams
     config->adv_service.UUID_Type = UUID_TYPE_16;
     config->adv_service.Service_UUID_16 = 0x18FF;
 
+    /* These two have to agree. bonding_mode = true makes the stack send an
+       SMP Security Request as soon as a central connects; pairing_method =
+       GapPairingNone then rejects whatever comes back, with SM error 3
+       (AUTHREQ), and the head drops the connection.
+
+       Seen from the P4 as an endless loop:
+           connected - discovering service (no pairing required)
+           pairing failed status=1283 (head rejected our authentication
+           requirements)
+           disconnected (reason=517)
+
+       Nothing here needs encryption - both characteristics below are
+       ATTR_PERMISSION_NONE - so the honest configuration is no pairing and no
+       bonding. */
     config->pairing_method = GapPairingNone;
-    config->bonding_mode = true;
+    config->bonding_mode = false;
 
     memcpy(config->mac_address, furi_hal_version_get_ble_mac(), sizeof(config->mac_address));
 

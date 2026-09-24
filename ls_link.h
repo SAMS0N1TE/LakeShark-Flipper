@@ -1,4 +1,6 @@
 #pragma once
+#include "ls_rec_load_ack.h"
+#include "ls_psys.h"
 
 #include <furi.h>
 #include <furi_hal_serial.h>
@@ -31,6 +33,8 @@ typedef enum {
 
 #define LS_REC_MAX_EDGES 4096
 #define LS_REC_CHUNK 32
+/*LS-526*/
+#define LS_REC_NAME_MAX 28
 
 typedef enum {
     LsFmListen,
@@ -51,11 +55,16 @@ typedef struct {
     int32_t vert_rate;
     int32_t age_ms;
     int32_t msg_count;
-    /**/
-    bool pos_valid;
+    bool seen;
+    /*LS-832  Position, in 1e-4 degrees, when the P4's CPR decode has one.
+
+       CPR needs a matched even/odd frame pair, so an aircraft is tracked -
+       callsign, altitude, velocity - for a while before it has any position.
+       pos_valid is what separates "at 0,0" from "not yet known", and a map
+       that ignores it puts every silent aircraft off the coast of Africa. */
     int32_t lat_e4;
     int32_t lon_e4;
-    bool seen;
+    bool pos_valid;
 } LsAircraft;
 
 typedef struct {
@@ -77,7 +86,6 @@ typedef struct {
     uint32_t free_dma;
 
     int32_t sdr_stall_s;
-    char rtl_health[12];
 
     int32_t eq_preset;
     int32_t eq_hp_hz;
@@ -153,8 +161,6 @@ typedef struct {
     int32_t ac_tracked;
     int32_t ac_count;
     int32_t msgs_total;
-    /**/
-    int32_t tts_vol;
     int32_t msgs_sec;
     int32_t crc_good;
     int32_t crc_err;
@@ -199,6 +205,10 @@ bool ls_link_is_up(LsLink* link);
 
 void ls_link_stats(LsLink* link, uint32_t* frames, uint32_t* replies, uint32_t* bad);
 
+/*LS-841  Empty until the radio has answered a VER, and on firmware too old
+   to send one it stays empty - which is itself the answer. */
+void ls_link_radio_version(LsLink* link, char* out, size_t out_len);
+
 void ls_link_last_reply(LsLink* link, char* out, size_t out_len);
 
 uint32_t ls_link_reply_age_ms(LsLink* link);
@@ -209,8 +219,27 @@ bool ls_link_rec_take(LsLink* link, uint32_t* offset, int* count, int32_t* out, 
 
 void ls_link_rec_reset(LsLink* link);
 
+/*LS-526*/
+bool ls_link_rec_file_take(
+    LsLink* link,
+    int* index,
+    int* total,
+    uint32_t* freq_hz,
+    long* size,
+    char* name,
+    size_t name_len);
+
 void ls_link_toggle_port(LsLink* link);
 
 const char* ls_link_port_name(LsLink* link);
 
 void ls_link_selftest(LsLink* link);
+
+/* Snapshot the latest correlated REC LOAD reply and its monotonic sequence. */
+uint32_t ls_link_rec_load_reply(LsLink* link, LsRecLoadAck* out);
+
+/* The latest PSYS reply and a sequence that moves on every one. */
+uint32_t ls_link_psys(LsLink* link, LsPsys* out);
+
+/* One PROF row, taken once. */
+bool ls_link_prof_take(LsLink* link, LsProfRow* out);
