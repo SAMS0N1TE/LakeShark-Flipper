@@ -1,3 +1,6 @@
+v2.7:
+Added DF Beacon to the launcher: a low-power (about -10 dBm) OOK transmitter on 915 MHz, or 433.92 MHz with LEFT and RIGHT, 250 ms on and 50 ms off, for calibrating the radio's COMPASS FIND against a known bearing. It needs no link to the radio. OK starts and stops it, leaving the screen stops it, and it stops by itself after three minutes. It says so when the region or the radio refuses to transmit.
+
 v2.6:
 Saved-file downloads work again. The REC LOAD acknowledgement was parsed with %llu, which the Flipper's scanf does not support, so every download from the FILES page timed out as Load failed. Files of 12 to 400 edges now arrive with every edge, the duration and the frequency matching the radio's copy.
 A SYSTEM page in P25 shows the loaded profile, GPS site following, Phase II follow with its grant count, and how many valid-looking frames the radio held back as noise. OK on PH2 FOLLOW switches it, OK on a profile loads it from the radio's card, and a long press of OK re-reads the card. Needs LakeShark firmware with the PSYS and PROF commands; an older radio says so.

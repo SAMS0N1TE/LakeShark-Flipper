@@ -38,7 +38,7 @@ void ls_cfg_defaults(LsCfg* cfg) {
 
     cfg->rx_wake = true;
 
-    /*LS-840  Defaults chosen so the alerts stay worth noticing. Pages, voice
+    /* Defaults chosen so the alerts stay worth noticing. Pages, voice
        and finished captures are events; aircraft are weather - in a busy
        corridor an alert per contact fires continuously, and an alert that
        always fires is one nobody reads. Sound off, buzz on: what actually

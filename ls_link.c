@@ -48,7 +48,7 @@ struct LsLink {
     char last_reply[64];
     uint32_t last_reply_tick;
 
-    /*LS-841  The radio's own version string, kept apart from last_reply.
+    /* The radio's own version string, kept apart from last_reply.
 
        last_reply is whatever came back most recently, and the probe timer
        overwrites it with a pong within a second or two - fine for a status
@@ -62,7 +62,6 @@ struct LsLink {
     int rec_count;
     bool rec_pending;
 
-    /*LS-526*/
     int rec_file_index;
     int rec_file_total;
     uint32_t rec_file_freq;
@@ -97,7 +96,7 @@ static void copy_field(char* dst, size_t dst_len, const char* src) {
         if(*p == '_') *p = ' ';
 }
 
-/*LS-832  Ten: the eight an aircraft always has, plus lat and lon. */
+/* Ten: the eight an aircraft always has, plus lat and lon. */
 #define AC_FIELD_MAX 10
 
 static void parse_aircraft(LsTelemetry* t, int slot, char* v) {
@@ -115,7 +114,7 @@ static void parse_aircraft(LsTelemetry* t, int slot, char* v) {
         }
         p++;
     }
-    /*LS-832  Eight fields is a complete aircraft; ten means it also carries a
+    /* Eight fields is a complete aircraft; ten means it also carries a
        position. Accept both so a head can talk to a radio that predates
        positions on the wire, and so an aircraft the decoder has not fixed yet
        is simply shorter rather than special. */
@@ -131,7 +130,6 @@ static void parse_aircraft(LsTelemetry* t, int slot, char* v) {
     a->age_ms = atoi(field[6]);
     a->msg_count = atoi(field[7]);
 
-    /*LS-832*/
     if(n >= 10) {
         a->lat_e4 = atoi(field[8]);
         a->lon_e4 = atoi(field[9]);
@@ -453,9 +451,8 @@ static void parse_eq_line(LsLink* link, char* line) {
     furi_mutex_release(link->lock);
 }
 
-/*LS-526*/
 /* %S <index> <total> <freq_hz> <bytes> <name>  - one saved capture per reply.
-   The board enumerates its directory one entry per round trip (LS-032) rather
+   The board enumerates its directory one entry per round trip rather
    than trying to fit every name in one 384 B line, so this parser handles a
    single row and the UI walks index 0..total-1. */
 static void parse_prof(LsLink* link, char* line);
@@ -578,7 +575,6 @@ void ls_link_rec_reset(LsLink* link) {
 
 static void handle_line(LsLink* link, char* line) {
     if(line[0] == '%') {
-        /*LS-526*/
         if(line[1] == 'S')
             parse_rec_file(link, line + 1);
         else if(line[1] == 'P')
@@ -593,7 +589,7 @@ static void handle_line(LsLink* link, char* line) {
         parse_telemetry(link, line + 1);
     } else if(line[0] == '+' || line[0] == '-') {
         furi_mutex_acquire(link->lock, FuriWaitForever);
-        /*LS-841  "+OK LakeShark_1.0.1-g8cc5b7be_board_..." - self-identifying,
+        /* "+OK LakeShark_1.0.1-g8cc5b7be_board_..." - self-identifying,
            so no request tracking is needed and an older radio that never sends
            it simply leaves the field empty.
 
@@ -757,7 +753,7 @@ LsLinkState ls_link_state(LsLink* link) {
     if(link->ble_starting) return LsStateBleStarting;
     if(link->ble_failed) return LsStateBleFailed;
 
-    /*LS-834  Believe the frames over the callback.
+    /* Believe the frames over the callback.
 
        This asked ble_connected - a flag set from bt_set_status_changed_callback
        - before it looked at whether anything was actually arriving. When that

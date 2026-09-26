@@ -1,4 +1,4 @@
-/*LS-836  The map, from ZeroMesh.
+/* The map, from ZeroMesh.
 
    Ported rather than reinvented: the tiling, the pmtiles reader, the mono
    carto style, focus/track and the pan-zoom input model are all solved there

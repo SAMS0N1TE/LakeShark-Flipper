@@ -83,7 +83,7 @@ static void edit_wrap(char* out, size_t len, const char* value) {
     snprintf(out, len, "<%s>", value ? value : "");
 }
 
-/*LS-845  Values stop short of the right edge, not at it.
+/* Values stop short of the right edge, not at it.
 
    elements_scrollbar draws in the last three columns, and every list page
    that shows a value also scrolls - so a value right-aligned to the edge had
@@ -280,7 +280,7 @@ void ls_ui_age(char* out, size_t len, int32_t age_ms) {
     }
 }
 
-/*LS-844  A list row with a glyph in front of the label.
+/* A list row with a glyph in front of the label.
 
    The launcher was six rows of the same shape, told apart only by reading
    them. An icon column turns "which one is ADS-B" into something the eye
@@ -315,7 +315,7 @@ void ls_ui_row_icon(
     if(selected) canvas_set_color(c, ColorBlack);
 }
 
-/*LS-840  A row whose value is a yes/no, drawn as a box instead of the word
+/* A row whose value is a yes/no, drawn as a box instead of the word
    "on". Alert settings are eight of these in a column; read as text they are a
    wall of the same two words, and the eye has to parse every line to find the
    one that is different. As boxes the state is the shape, and the odd one out

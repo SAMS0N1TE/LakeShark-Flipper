@@ -33,7 +33,6 @@ typedef enum {
 
 #define LS_REC_MAX_EDGES 4096
 #define LS_REC_CHUNK 32
-/*LS-526*/
 #define LS_REC_NAME_MAX 28
 
 typedef enum {
@@ -56,7 +55,7 @@ typedef struct {
     int32_t age_ms;
     int32_t msg_count;
     bool seen;
-    /*LS-832  Position, in 1e-4 degrees, when the P4's CPR decode has one.
+    /* Position, in 1e-4 degrees, when the P4's CPR decode has one.
 
        CPR needs a matched even/odd frame pair, so an aircraft is tracked -
        callsign, altitude, velocity - for a while before it has any position.
@@ -205,7 +204,7 @@ bool ls_link_is_up(LsLink* link);
 
 void ls_link_stats(LsLink* link, uint32_t* frames, uint32_t* replies, uint32_t* bad);
 
-/*LS-841  Empty until the radio has answered a VER, and on firmware too old
+/* Empty until the radio has answered a VER, and on firmware too old
    to send one it stays empty - which is itself the answer. */
 void ls_link_radio_version(LsLink* link, char* out, size_t out_len);
 
@@ -219,7 +218,6 @@ bool ls_link_rec_take(LsLink* link, uint32_t* offset, int* count, int32_t* out, 
 
 void ls_link_rec_reset(LsLink* link);
 
-/*LS-526*/
 bool ls_link_rec_file_take(
     LsLink* link,
     int* index,

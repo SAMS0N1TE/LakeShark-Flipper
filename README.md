@@ -33,6 +33,8 @@ Frequencies can be typed in directly, stepped with the tuning control, or recall
 
 Settings are split into levels, link, device, display and about. From the device page you can reboot the radio, reset the coprocessor, restart or power cycle the SDR, and turn the radio's Bluetooth off.
 
+DF Beacon turns the Flipper into a low-power transmitter for calibrating the radio's COMPASS FIND: set it down a few metres away, start it, and follow the calibration steps on the radio. It sends on 915 MHz at about -10 dBm by default; LEFT and RIGHT pick 433.92 MHz before it starts. It stops after three minutes.
+
 The head alerts you when the receiver drops off or goes silent, and again when it comes back. This is mainly a workaround due to certain ESP32-P4 boards behaving differently with USB connections. Hoping I can get this more reliable in the future.
 
 ## Connection

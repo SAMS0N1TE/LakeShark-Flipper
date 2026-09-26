@@ -1,6 +1,6 @@
 #pragma once
 
-/*LS-840  What the alert stack needs from its host, and nothing else.
+/* What the alert stack needs from its host, and nothing else.
 
    Ported from ZeroMesh the same way the map was, and for the same reason: it
    is written, it works, and it is exactly the feature a receiver in a pocket

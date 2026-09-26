@@ -1,4 +1,4 @@
-/*LS-840  Alerts, ported from ZeroMesh.
+/* Alerts, ported from ZeroMesh.
 
    A receiver in a bag is a receiver you cannot watch, so it has to tell you
    when something happened. ZeroMesh already had the whole stack - an RTTTL

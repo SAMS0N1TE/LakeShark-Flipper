@@ -14,7 +14,7 @@
 #define TAG "zeromesh_map"
 
 #define MAP_DIR            APP_DATA_PATH("map")
-/*LS-836  Read ZeroMesh's archive, do not ask for a second copy.
+/* Read ZeroMesh's archive, do not ask for a second copy.
    A pmtiles map is tens of megabytes. Two apps by the same author on the
    same SD card should not each carry one. APP_DATA_PATH here would resolve
    to /ext/apps_data/lakeshark_p25/, so the path is spelled out.
@@ -390,7 +390,7 @@ void map_tick(LsMapCtx* app) {
         app->need_render = true;
     }
 
-    /*LS-839  Hold tracking: keep the focused aircraft under the crosshair.
+    /* Hold tracking: keep the focused aircraft under the crosshair.
 
        ZeroMesh recentres once, in map_focus_index, and never again - which is
        right for a Meshtastic node that sits on a hilltop for a week. An
@@ -890,7 +890,7 @@ static void map_draw_focus_range(Canvas* canvas, LsMapCtx* app) {
     }
 }
 
-/*LS-836  The head has no GPS. ZeroMesh drew its own fix here; a Flipper
+/* The head has no GPS. ZeroMesh drew its own fix here; a Flipper
    wired to a LakeShark has no receiver of its own, so there is nothing to
    draw. Kept as a stub rather than deleted, because when the T-Display-P4's
    L76K starts reporting a position over the link this is where it goes. */
@@ -1164,7 +1164,7 @@ static void toolbar_activate(LsMapCtx* app) {
     case 2:
         if(!map_focus_node(app, 0u)) {
             map_focus_index(app, -1);
-            /*LS-836  ZeroMesh has a status line to write to; this app does
+            /* ZeroMesh has a status line to write to; this app does
                not, and the toast belongs to the host rather than the
                renderer. The caller already learns this from the return
                value of map_focus_node. */

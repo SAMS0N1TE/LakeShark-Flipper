@@ -1,6 +1,6 @@
 #pragma once
 
-/*LS-836  What the map needs from whoever is hosting it, and nothing else.
+/* What the map needs from whoever is hosting it, and nothing else.
 
    The obvious port would have bound the renderer to LsApp the way ZeroMesh
    binds it to ZeroMeshApp. That does not work here - LsApp is declared inside
