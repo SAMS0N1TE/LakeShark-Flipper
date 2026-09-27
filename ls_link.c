@@ -234,6 +234,8 @@ static void apply_kv(LsTelemetry* t, char* tok) {
         t->beep = atoi(v);
     else if((v = kv(tok, "vg")))
         t->voice_gate = atoi(v);
+    else if((v = kv(tok, "tv")))
+        t->tts_volume = atoi(v);
     else if((v = kv(tok, "rf")))
         t->ring_fill = atoi(v);
     else if((v = kv(tok, "rs")))
@@ -367,6 +369,8 @@ static void parse_telemetry(LsLink* link, char* line) {
     uint32_t carry_up = t->uptime_s;
     uint32_t carry_fi = t->free_internal;
     uint32_t carry_fd = t->free_dma;
+    /* Only ADS-B frames carry tv=; the level stays known across the others. */
+    int32_t carry_tv = t->tts_volume;
 
     int32_t carry_eq[7] = {
         t->eq_preset,
@@ -383,6 +387,7 @@ static void parse_telemetry(LsLink* link, char* line) {
     t->uptime_s = carry_up;
     t->free_internal = carry_fi;
     t->free_dma = carry_fd;
+    t->tts_volume = carry_tv;
 
     t->eq_preset = carry_eq[0];
     t->eq_hp_hz = carry_eq[1];
@@ -600,6 +605,11 @@ static void handle_line(LsLink* link, char* line) {
         if(!strncmp(line, "+OK LakeShark", 13) && (line[13] == '_' || line[13] == ' ')) {
             strncpy(link->radio_ver, line + 4, sizeof(link->radio_ver) - 1);
             link->radio_ver[sizeof(link->radio_ver) - 1] = '\0';
+        }
+        /* The answer to TTSVOL, asked when Settings opens. */
+        if(!strncmp(line, "+OK tv=", 7)) {
+            link->parsed.tts_volume = atoi(line + 7);
+            link->tel.tts_volume = link->parsed.tts_volume;
         }
         LsPsys psys;
         if(ls_psys_parse(line, &psys)) {
@@ -826,6 +836,8 @@ LsLink* ls_link_alloc(uint32_t baud) {
     link->lock = furi_mutex_alloc(FuriMutexTypeNormal);
     link->rx_stream = furi_stream_buffer_alloc(RX_STREAM_SZ, 1);
 
+    link->parsed.tts_volume = -1;
+    link->tel.tts_volume = -1;
     link->port = LS_LINK_PORT;
     link->baud = baud;
     link->serial = furi_hal_serial_control_acquire(link->port);

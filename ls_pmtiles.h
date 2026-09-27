@@ -6,6 +6,12 @@
 
 typedef struct PmTiles PmTiles;
 
+/* The Flipper's malloc reboots the device rather than return NULL, so a
+   large buffer is asked for only when the largest free block covers it with
+   LS_HEAP_SPARE left for the rest of the app. */
+#define LS_HEAP_SPARE 12288
+bool ls_heap_fits(size_t bytes);
+
 PmTiles* pmtiles_open(const char* path);
 
 void pmtiles_close(PmTiles* p);

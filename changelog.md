@@ -1,3 +1,8 @@
+v2.8:
+Settings, Levels has a Voice row that sets the radio's speech level, as a share of Vol, in steps of 5. It shows the radio's own level once the radio reports it; that needs LakeShark 2.5.0.
+Opening the app is reliable after a long session. The ADS-B map now loads only on its own page and gives its memory back when you leave it, and every large allocation checks that the heap can spare it first.
+Large offline maps draw over Bluetooth. An archive whose tiles are all listed in its root directory is read from the SD card in place instead of indexed in memory, and the tile buffer takes what the heap can spare.
+
 v2.7:
 Added DF Beacon to the launcher: a low-power (about -10 dBm) OOK transmitter on 915 MHz, or 433.92 MHz with LEFT and RIGHT, 250 ms on and 50 ms off, for calibrating the radio's COMPASS FIND against a known bearing. It needs no link to the radio. OK starts and stops it, leaving the screen stops it, and it stops by itself after three minutes. It says so when the region or the radio refuses to transmit.
 

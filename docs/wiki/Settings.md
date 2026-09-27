@@ -14,6 +14,7 @@ For a value, press **OK**, adjust with **Left / Right**, then press **OK** or **
 | Gain | RTL-SDR tuner gain, using the tuner's supported gain steps. |
 | Sql | Squelch threshold. |
 | Vgate | Voice gate threshold. |
+| Voice | The radio's speech level as a share of Vol, 0 to 100 in steps of 5. Shows -- until the radio reports it (LakeShark 2.5.0 and later). |
 
 Hold **OK** on this page, while not editing, to toggle mute.
 

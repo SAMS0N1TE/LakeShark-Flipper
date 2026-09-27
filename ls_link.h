@@ -112,6 +112,7 @@ typedef struct {
     int32_t polarity_inverted;
     int32_t beep;
     int32_t voice_gate;
+    int32_t tts_volume; /* speech level, % of volume; -1 until the radio says */
     int32_t ring_fill;
     int32_t ring_size;
     uint32_t audio_drops;

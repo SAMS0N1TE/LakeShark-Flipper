@@ -1,10 +1,15 @@
 #include "ls_pmtiles.h"
 
 #include <furi.h>
+#include <core/memmgr_heap.h>
 #include <storage/storage.h>
 #include <string.h>
 
 #define TAG "zeromesh_pmtiles"
+
+bool ls_heap_fits(size_t bytes) {
+    return memmgr_heap_get_max_free_block() >= bytes + LS_HEAP_SPARE;
+}
 
 #define PM_HEADER_LEN     127
 #define PM_COMPRESSION_NONE 1
@@ -17,6 +22,17 @@
    heap this size: cost stops scaling with tile count. */
 #define PM_MAX_LEAF_BYTES   (4 * 1024)
 #define PM_MAX_LEAF_ENTRIES 256
+
+#define PM_STEP 64
+
+/* Where entry k*PM_STEP starts in each of the four columns, and what the
+   entry before it left behind for the ones that are delta coded. */
+typedef struct {
+    uint64_t first_id;
+    uint64_t id_before;
+    uint32_t ids_pos, runs_pos, len_pos, off_pos;
+    uint32_t prev_off, prev_len;
+} PmCheck;
 
 struct PmTiles {
     Storage* storage;
@@ -41,6 +57,16 @@ struct PmTiles {
 
     uint8_t min_zoom;
     uint8_t max_zoom;
+
+    /* A root directory with no leaves lists every tile, and its index
+       costs 17 bytes a tile - more than the heap has with the app open. It
+       is read from the card instead, from checkpoints every PM_STEP
+       entries, so only a checkpoint's worth is decoded per lookup. */
+    bool stream;
+    uint64_t root_off;
+    uint32_t root_len;
+    PmCheck* checks;
+    uint32_t n_checks;
 };
 
 static uint64_t rd_varint(const uint8_t* b, size_t len, size_t* p) {
@@ -104,6 +130,169 @@ static bool read_at(File* f, uint64_t off, void* dst, size_t len) {
         if(got == 0) return false;
         done += got;
     }
+    return true;
+}
+
+typedef struct {
+    File* f;
+    uint64_t base;
+    uint32_t len;
+    uint32_t pos;
+    uint32_t buf_start;
+    uint16_t buf_fill;
+    bool bad;
+    uint8_t buf[128];
+} PmReader;
+
+static void rdr_init(PmReader* r, File* f, uint64_t base, uint32_t len, uint32_t pos) {
+    r->f = f;
+    r->base = base;
+    r->len = len;
+    r->pos = pos;
+    r->buf_start = 0;
+    r->buf_fill = 0;
+    r->bad = false;
+}
+
+static uint8_t rdr_byte(PmReader* r) {
+    if(r->pos >= r->len) {
+        r->bad = true;
+        return 0;
+    }
+    if(r->pos < r->buf_start || r->pos >= r->buf_start + r->buf_fill) {
+        uint32_t n = r->len - r->pos;
+        if(n > sizeof(r->buf)) n = sizeof(r->buf);
+        if(!read_at(r->f, r->base + r->pos, r->buf, n)) {
+            r->bad = true;
+            return 0;
+        }
+        r->buf_start = r->pos;
+        r->buf_fill = (uint16_t)n;
+    }
+    return r->buf[r->pos++ - r->buf_start];
+}
+
+static uint64_t rdr_varint(PmReader* r) {
+    uint64_t v = 0;
+    for(int s = 0; s < 64 && !r->bad; s += 7) {
+        uint8_t c = rdr_byte(r);
+        v |= (uint64_t)(c & 0x7f) << s;
+        if(!(c & 0x80)) break;
+    }
+    return v;
+}
+
+/* One pass over the directory: checkpoints, and the largest tile. */
+static bool stream_index(PmTiles* p) {
+    const uint32_t n = p->count;
+    p->n_checks = (n + PM_STEP - 1) / PM_STEP;
+    if(!ls_heap_fits(sizeof(PmCheck) * p->n_checks)) {
+        FURI_LOG_E(TAG, "no room for %lu checkpoints", (unsigned long)p->n_checks);
+        return false;
+    }
+    p->checks = malloc(sizeof(PmCheck) * p->n_checks);
+    if(!p->checks) return false;
+    memset(p->checks, 0, sizeof(PmCheck) * p->n_checks);
+
+    PmReader r;
+    rdr_init(&r, p->file, p->root_off, p->root_len, 0);
+    rdr_varint(&r);
+
+    uint64_t last = 0;
+    for(uint32_t i = 0; i < n; i++) {
+        PmCheck* c = (i % PM_STEP) ? NULL : &p->checks[i / PM_STEP];
+        if(c) {
+            c->ids_pos = r.pos;
+            c->id_before = last;
+        }
+        last += rdr_varint(&r);
+        if(c) c->first_id = last;
+    }
+    for(uint32_t i = 0; i < n; i++) {
+        if(!(i % PM_STEP)) p->checks[i / PM_STEP].runs_pos = r.pos;
+        rdr_varint(&r);
+    }
+    uint32_t prev_len = 0;
+    for(uint32_t i = 0; i < n; i++) {
+        if(!(i % PM_STEP)) {
+            p->checks[i / PM_STEP].len_pos = r.pos;
+            p->checks[i / PM_STEP].prev_len = prev_len;
+        }
+        prev_len = (uint32_t)rdr_varint(&r);
+        if(prev_len > p->max_len) p->max_len = prev_len;
+    }
+    /* Offsets need the lengths beside them: a zero means "just after the
+       previous tile". A second reader walks the lengths in step. */
+    PmReader lr;
+    rdr_init(&lr, p->file, p->root_off, p->root_len, p->checks[0].len_pos);
+    uint32_t prev_off = 0;
+    prev_len = 0;
+    for(uint32_t i = 0; i < n; i++) {
+        if(!(i % PM_STEP)) {
+            p->checks[i / PM_STEP].off_pos = r.pos;
+            p->checks[i / PM_STEP].prev_off = prev_off;
+        }
+        const uint64_t v = rdr_varint(&r);
+        const uint32_t cur = (v == 0) ? (i ? prev_off + prev_len : 0) : (uint32_t)(v - 1);
+        prev_len = (uint32_t)rdr_varint(&lr);
+        prev_off = cur;
+    }
+    if(r.bad || lr.bad) {
+        FURI_LOG_E(TAG, "root directory shorter than its entry count");
+        return false;
+    }
+    return true;
+}
+
+static bool stream_find(PmTiles* p, uint64_t want, uint32_t* out_off, uint32_t* out_len) {
+    uint32_t lo = 0, hi = p->n_checks;
+    int64_t k = -1;
+    while(lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2;
+        if(p->checks[mid].first_id <= want) {
+            k = mid;
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if(k < 0) return false;
+    const PmCheck* c = &p->checks[k];
+    const uint32_t first = (uint32_t)k * PM_STEP;
+    uint32_t end = first + PM_STEP;
+    if(end > p->count) end = p->count;
+
+    PmReader r;
+    rdr_init(&r, p->file, p->root_off, p->root_len, c->ids_pos);
+    uint64_t last = c->id_before, hit_id = 0;
+    int64_t hit = -1;
+    for(uint32_t i = first; i < end; i++) {
+        last += rdr_varint(&r);
+        if(last > want) break;
+        hit = i;
+        hit_id = last;
+    }
+    if(hit < 0 || r.bad) return false;
+
+    rdr_init(&r, p->file, p->root_off, p->root_len, c->runs_pos);
+    uint64_t run = 0;
+    for(uint32_t i = first; i <= (uint32_t)hit; i++)
+        run = rdr_varint(&r);
+    if(run == 0 || want >= hit_id + run) return false;
+
+    PmReader lr;
+    rdr_init(&r, p->file, p->root_off, p->root_len, c->off_pos);
+    rdr_init(&lr, p->file, p->root_off, p->root_len, c->len_pos);
+    uint32_t prev_off = c->prev_off, prev_len = c->prev_len;
+    for(uint32_t i = first; i <= (uint32_t)hit; i++) {
+        const uint64_t v = rdr_varint(&r);
+        const uint32_t cur = (v == 0) ? (i ? prev_off + prev_len : 0) : (uint32_t)(v - 1);
+        prev_len = (uint32_t)rdr_varint(&lr);
+        prev_off = cur;
+    }
+    if(r.bad || lr.bad) return false;
+    *out_off = prev_off;
+    *out_len = prev_len;
     return true;
 }
 
@@ -247,6 +436,10 @@ PmTiles* pmtiles_open(const char* path) {
     p->max_zoom = h[101];
 
     if(leaf_len != 0) {
+        if(!ls_heap_fits(PM_MAX_LEAF_BYTES + sizeof(uint32_t) * PM_MAX_LEAF_ENTRIES)) {
+            FURI_LOG_E(TAG, "no room for leaf directory buffers");
+            goto fail;
+        }
         p->leaf_buf = malloc(PM_MAX_LEAF_BYTES);
         p->len_scratch = malloc(sizeof(uint32_t) * PM_MAX_LEAF_ENTRIES);
         if(!p->leaf_buf || !p->len_scratch) {
@@ -259,6 +452,40 @@ PmTiles* pmtiles_open(const char* path) {
         goto fail;
     }
 
+    p->root_off = root_off;
+    p->root_len = (uint32_t)root_len;
+
+    /* Leafless and too big to index in this heap: read it in place. */
+    if(leaf_len == 0) {
+        uint8_t head[10];
+        const size_t hl = root_len < sizeof(head) ? (size_t)root_len : sizeof(head);
+        size_t hq = 0;
+        if(!read_at(p->file, root_off, head, hl)) goto fail;
+        const uint64_t entries = rd_varint(head, hl, &hq);
+        const size_t index_bytes = (sizeof(uint64_t) + 2 * sizeof(uint32_t) + 1) * (size_t)entries;
+        if(entries && entries <= 100000 &&
+           !ls_heap_fits((size_t)root_len + index_bytes)) {
+            p->count = (uint32_t)entries;
+            p->stream = true;
+            if(!stream_index(p)) goto fail;
+            p->tile_total = p->count;
+            FURI_LOG_I(
+                TAG,
+                "streaming %s: %lu tiles z%u-%u, max tile %lu b, %lu checkpoints",
+                path,
+                (unsigned long)p->tile_total,
+                p->min_zoom,
+                p->max_zoom,
+                (unsigned long)p->max_len,
+                (unsigned long)p->n_checks);
+            return p;
+        }
+    }
+
+    if(!ls_heap_fits((size_t)root_len)) {
+        FURI_LOG_E(TAG, "no room for a %lu byte root dir", (unsigned long)root_len);
+        goto fail;
+    }
     dir = malloc((size_t)root_len);
     if(!dir || !read_at(p->file, root_off, dir, (size_t)root_len)) {
         FURI_LOG_E(TAG, "cannot read root dir");
@@ -273,6 +500,11 @@ PmTiles* pmtiles_open(const char* path) {
     }
     p->count = (uint32_t)n;
 
+    /* The raw directory is still held while these are filled. */
+    if(!ls_heap_fits((sizeof(uint64_t) + 2 * sizeof(uint32_t) + 1) * (size_t)p->count)) {
+        FURI_LOG_E(TAG, "no room to index %lu entries", (unsigned long)n);
+        goto fail;
+    }
     p->ids = malloc(sizeof(uint64_t) * p->count);
     p->offsets = malloc(sizeof(uint32_t) * p->count);
     p->lengths = malloc(sizeof(uint32_t) * p->count);
@@ -334,6 +566,7 @@ void pmtiles_close(PmTiles* p) {
     free(p->runs);
     free(p->leaf_buf);
     free(p->len_scratch);
+    free(p->checks);
     if(p->file) {
         storage_file_close(p->file);
         storage_file_free(p->file);
@@ -348,6 +581,7 @@ static bool pm_locate(PmTiles* p, uint8_t z, uint32_t x, uint32_t y, uint32_t* o
     if(z < p->min_zoom || z > p->max_zoom) return false;
 
     uint64_t want = zxy_to_tileid(z, x, y);
+    if(p->stream) return stream_find(p, want, off, len);
     int64_t idx = dir_upper(p->ids, p->count, want);
     if(idx < 0) return false;
 

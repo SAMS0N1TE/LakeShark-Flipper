@@ -17,6 +17,7 @@
 #include "ls_link.h"
 #include "ls_ui.h"
 #include "ls_map.h"
+#include "ls_pmtiles.h"
 #include "ls_notify.h"
 #include "ls_rtttl.h"
 
@@ -252,6 +253,7 @@ typedef enum {
     ECHO_GAIN,
     ECHO_SQL,
     ECHO_VGATE,
+    ECHO_TTS,
     ECHO_EQ_PRESET,
     ECHO_EQ_HP,
     ECHO_EQ_BASS,
@@ -324,7 +326,12 @@ typedef struct {
        so the same renderer can be lifted onto the P4 later without dragging
        this struct with it. */
     LsMapCtx map_ctx;
+    /* The map is loaded only while its page is showing: its tile buffer,
+       frame and archive index are some 28 KB of a heap the rest of the app
+       nearly fills, and holding them from launch left too little to load
+       the app a second time. */
     bool map_ready;
+    bool map_failed;
 
     /* Alerts. A receiver you are not looking at has to say when
        something happened, so the head buzzes, blinks or plays a tone.
@@ -1140,11 +1147,11 @@ static void rec_xfer_start_capture(LsApp* app, int total, uint32_t freq_hz, uint
     if(total > LS_REC_MAX_EDGES) { toast(app, "Capture too large"); return; }
 
     rec_preview_clear(app);
-    app->rec_buf = malloc(sizeof(int32_t) * (size_t)total);
-    if(!app->rec_buf) {
-        toast(app, "Out of memory");
+    if(!ls_heap_fits(sizeof(int32_t) * (size_t)total)) {
+        toast(app, "Not enough memory");
         return;
     }
+    app->rec_buf = malloc(sizeof(int32_t) * (size_t)total);
 
     app->rec_total = total;
     app->rec_have = 0;
@@ -2133,7 +2140,10 @@ static void map_sync_aircraft(LsApp* app) {
 
 static void draw_adsb_map(Canvas* c, LsApp* app) {
     if(!app->map_ready) {
-        ls_ui_empty(c, "Map unavailable", "no map.pmtiles");
+        if(app->map_failed)
+            ls_ui_empty(c, "Map unavailable", "not enough memory");
+        else
+            ls_ui_empty(c, "Loading map", "");
         return;
     }
     /* DRAW ONLY. map_tick reads tiles off the SD card and decodes MVT
@@ -2501,6 +2511,7 @@ typedef enum {
     LVL_GAIN,
     LVL_SQL,
     LVL_VGATE,
+    LVL_TTS,
     LVL_COUNT,
 } LsLevel;
 
@@ -2512,50 +2523,62 @@ static void draw_set_levels(Canvas* c, LsApp* app) {
     int32_t gain = echo_get(app, ECHO_GAIN, t->gain_tenths);
     int32_t sql = echo_get(app, ECHO_SQL, t->squelch_tenths);
     int32_t vg = echo_get(app, ECHO_VGATE, t->voice_gate);
+    /* Speech level on the radio, as a share of Vol. "--" until the radio
+       answers; one without speech never does. */
+    int32_t tts = echo_get(app, ECHO_TTS, t->tts_volume);
 
+    /* Four rows fit under the header; the list scrolls with the focus. */
+    const int visible = (body_full(c) - body_top()) / LS_ROW_H;
+    const int first = clampi(app->focus - (visible - 1), 0, LVL_COUNT - visible);
     int y = body_top();
     char v[20];
 
-#define LVL_EDIT(row) (app->editing && app->focus == (row))
-
-    snprintf(v, sizeof(v), "%ld%s", (long)vol, t->muted ? " M" : "");
-    ls_ui_level_edit(
-        c, y, "Vol", v, clampi((int)vol, 0, 100), app->focus == LVL_VOL, LVL_EDIT(LVL_VOL));
-    y += LS_ROW_H;
-
-    snprintf(v, sizeof(v), "%ld.%ld", (long)(gain / 10), (long)(gain % 10));
-    ls_ui_level_edit(
-        c,
-        y,
-        "Gain",
-        v,
-        clampi((int)(gain * 100 / 496), 0, 100),
-        app->focus == LVL_GAIN,
-        LVL_EDIT(LVL_GAIN));
-    y += LS_ROW_H;
-
-    snprintf(v, sizeof(v), "%ld", (long)sql);
-    ls_ui_level_edit(
-        c, y, "Sql", v, clampi((int)sql, 0, 100), app->focus == LVL_SQL, LVL_EDIT(LVL_SQL));
-    y += LS_ROW_H;
-
-    snprintf(v, sizeof(v), "%ld", (long)vg);
-    ls_ui_level_edit(
-        c,
-        y,
-        "Vgate",
-        v,
-        clampi(((int)vg - 6) * 100 / 93, 0, 100),
-        app->focus == LVL_VGATE,
-        LVL_EDIT(LVL_VGATE));
-    y += LS_ROW_H;
-
-#undef LVL_EDIT
-
-    if(y + LS_ROW_H <= body_full(c)) {
-        snprintf(v, sizeof(v), "%s", t->muted ? "ON" : "off");
-        ls_ui_row(c, y, "Mute", v, false);
+    for(int row = first; row < LVL_COUNT && row < first + visible; row++) {
+        const char* label = "";
+        int pct = 0;
+        switch(row) {
+        case LVL_VOL:
+            label = "Vol";
+            snprintf(v, sizeof(v), "%ld%s", (long)vol, t->muted ? " M" : "");
+            pct = (int)vol;
+            break;
+        case LVL_GAIN:
+            label = "Gain";
+            snprintf(v, sizeof(v), "%ld.%ld", (long)(gain / 10), (long)(gain % 10));
+            pct = (int)(gain * 100 / 496);
+            break;
+        case LVL_SQL:
+            label = "Sql";
+            snprintf(v, sizeof(v), "%ld", (long)sql);
+            pct = (int)sql;
+            break;
+        case LVL_VGATE:
+            label = "Vgate";
+            snprintf(v, sizeof(v), "%ld", (long)vg);
+            pct = ((int)vg - 6) * 100 / 93;
+            break;
+        case LVL_TTS:
+            label = "Voice";
+            if(tts >= 0)
+                snprintf(v, sizeof(v), "%ld%%", (long)tts);
+            else
+                snprintf(v, sizeof(v), "--");
+            pct = tts < 0 ? 0 : (int)tts;
+            break;
+        default:
+            break;
+        }
+        ls_ui_level_edit(
+            c,
+            y,
+            label,
+            v,
+            clampi(pct, 0, 100),
+            app->focus == row,
+            app->editing && app->focus == row);
+        y += LS_ROW_H;
     }
+    elements_scrollbar(c, app->focus, LVL_COUNT);
 }
 
 typedef enum {
@@ -3547,6 +3570,14 @@ static void adjust_level(LsApp* app, LsLevel which, int dir) {
         echo_set(app, ECHO_VGATE, v);
         break;
     }
+    case LVL_TTS: {
+        const int32_t cur = echo_get(app, ECHO_TTS, t->tts_volume);
+        int v = clampi((cur < 0 ? 100 : (int)cur) + 5 * dir, 0, 100);
+        ls_link_send(app->link, "TTSVOL %d", v);
+        echo_set(app, ECHO_TTS, v);
+        ls_dbg("settings: voice level %ld -> %d", (long)cur, v);
+        break;
+    }
     default:
         break;
     }
@@ -3881,6 +3912,8 @@ static void handle_launcher(LsApp* app, InputEvent* ev, bool press) {
             app->focus = 0;
             app->list_top = 0;
             app->editing = false;
+            ls_link_send(app->link, "TTSVOL"); /* the Voice row's current level */
+            ls_dbg("settings: levels, asked the radio for TTSVOL");
         }
     } else if(ev->type == InputTypeShort && ev->key == InputKeyBack) {
 
@@ -4470,10 +4503,6 @@ int32_t lakeshark_p25_app(void* p) {
     furi_thread_start(app->alert_thr);
 
     app->map_ctx.lock = app->lock;
-    app->map_ready = map_alloc(&app->map_ctx);
-    if(!app->map_ready) {
-        FURI_LOG_W("LsApp", "map unavailable - no map.pmtiles on the card");
-    }
 
     app->link = ls_link_alloc(LS_LINK_BAUD_DEFAULT);
     ls_link_send(app->link, "PING");
@@ -4565,7 +4594,8 @@ int32_t lakeshark_p25_app(void* p) {
 
         /* Marker sync only. map_tick is called AFTER the mutex is
            released - see below. */
-        const bool map_live = app->map_ready && cur_page(app) == PG_ADSB_MAP;
+        const bool on_map = app->screen == LsScreenApp && cur_page(app) == PG_ADSB_MAP;
+        const bool map_live = app->map_ready && on_map;
         if(map_live) map_sync_aircraft(app);
 
         uint32_t frames = 0;
@@ -4662,6 +4692,23 @@ int32_t lakeshark_p25_app(void* p) {
            A later change moved this out of the draw callback and was right to; it
            just landed on the wrong side of the mutex. */
         if(map_live) map_tick(&app->map_ctx);
+
+        /* Load the map on its page and let it go on leaving. Both outside
+           the lock: map_alloc reads the card, and map_free takes the lock. */
+        if(on_map && !app->map_ready && !app->map_failed) {
+            const bool ok = map_alloc(&app->map_ctx);
+            furi_mutex_acquire(app->lock, FuriWaitForever);
+            app->map_ready = ok;
+            app->map_failed = !ok;
+            furi_mutex_release(app->lock);
+            view_port_update(app->vp);
+        } else if(!on_map && (app->map_ready || app->map_failed)) {
+            furi_mutex_acquire(app->lock, FuriWaitForever);
+            app->map_ready = false;
+            app->map_failed = false;
+            furi_mutex_release(app->lock);
+            map_free(&app->map_ctx);
+        }
 
         if(app->pending_transport >= 0) {
             LsTransport want = (LsTransport)app->pending_transport;

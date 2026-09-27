@@ -6,6 +6,7 @@
 
 #include "ls_mvtlabel.h"
 #include "ls_pmtiles.h"
+#include "ls_dbg.h"
 #include "mvt.h"
 #include "carto/raster.h"
 #include "carto/style.h"
@@ -25,6 +26,11 @@
 #define MAP_PMTILES_OLD    "/ext/zeromesh/map.pmtiles"
 #define MAP_TILE_MAX   24576
 #define MAP_SCRATCH_PT 384
+/* The tile buffer takes what the heap can spare down to this much left
+   over, rather than all or nothing: a tile bigger than the buffer is the
+   only one skipped. Below MAP_TILE_MIN it is not worth having. */
+#define MAP_TILE_SPARE 8192
+#define MAP_TILE_MIN   2048
 #define MAP_MAX_LABELS 6
 #define MAP_MAX_TOWNS  16
 #define MAP_TOOLBAR_N  6
@@ -1263,11 +1269,19 @@ void input_map(InputEvent* e, LsMapCtx* app) {
 bool map_alloc(LsMapCtx* app) {
     if(!app || app->map) return app && app->map;
 
+    const size_t fb_bytes = (size_t)((MAP_W + 7) / 8) * MAP_H;
+    if(!ls_heap_fits(sizeof(MapState) + fb_bytes + sizeof(carto_ipt) * MAP_SCRATCH_PT)) {
+        FURI_LOG_E(TAG, "no room for the map, free heap %u", (unsigned)memmgr_get_free_heap());
+        ls_dbg(
+            "map: no room, largest block %u",
+            (unsigned)memmgr_heap_get_max_free_block());
+        return false;
+    }
     MapState* m = malloc(sizeof(MapState));
     if(!m) return false;
     memset(m, 0, sizeof(MapState));
 
-    m->fb_pixels = malloc((size_t)((MAP_W + 7) / 8) * MAP_H);
+    m->fb_pixels = malloc(fb_bytes);
     m->scratch = malloc(sizeof(carto_ipt) * MAP_SCRATCH_PT);
     if(!m->fb_pixels || !m->scratch) {
         free(m->fb_pixels);
@@ -1292,14 +1306,33 @@ bool map_alloc(LsMapCtx* app) {
                 (unsigned long)biggest,
                 (unsigned)MAP_TILE_MAX);
         }
+    } else {
+        /* No archive: loose tiles, or nothing to read at all, in which case
+           the map shows aircraft on a blank ground and needs no buffer. */
+        Storage* storage = furi_record_open(RECORD_STORAGE);
+        if(!storage_dir_exists(storage, MAP_DIR) && !storage_dir_exists(storage, MAP_DIR_OLD))
+            tile_buf = 0;
+        furi_record_close(RECORD_STORAGE);
     }
 
-    m->tile = malloc(tile_buf);
+    if(tile_buf && !ls_heap_fits(tile_buf)) {
+        const size_t block = memmgr_heap_get_max_free_block();
+        const size_t room = block > MAP_TILE_SPARE ? block - MAP_TILE_SPARE : 0;
+        tile_buf = room >= MAP_TILE_MIN ? (room < tile_buf ? room : tile_buf) : 0;
+    }
+    if(tile_buf) m->tile = malloc(tile_buf);
     m->tile_cap = m->tile ? tile_buf : 0;
-    if(!m->tile) {
+    ls_dbg(
+        "map: archive %s, %lu tiles, max tile %lu b, tile buffer %u b, largest block now %u",
+        m->pm ? "open" : "none",
+        (unsigned long)pmtiles_tile_count(m->pm),
+        (unsigned long)pmtiles_max_tile_len(m->pm),
+        (unsigned)m->tile_cap,
+        (unsigned)memmgr_heap_get_max_free_block());
+    if(tile_buf && !m->tile) {
         FURI_LOG_E(
             TAG,
-            "tile buffer %u failed, free heap %u",
+            "no room for a %u byte tile buffer, free heap %u",
             (unsigned)tile_buf,
             (unsigned)memmgr_get_free_heap());
     }
