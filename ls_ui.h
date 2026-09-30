@@ -67,6 +67,8 @@ void ls_ui_empty(Canvas* c, const char* line1, const char* line2);
 
 void ls_ui_modal(Canvas* c, const char* title, const char* line1, const char* line2);
 
+void ls_ui_modal_progress(Canvas* c, const char* title, const char* line1, int pct);
+
 void ls_ui_toast(Canvas* c, const char* text);
 
 void ls_ui_mhz(char* out, size_t len, uint32_t hz);

@@ -20,11 +20,12 @@
 #include "ls_pmtiles.h"
 #include "ls_notify.h"
 #include "ls_rtttl.h"
+#include "ls_subfsk.h"
 
 /* Kept in step with fap_version in application.fam by hand; the
    build does not hand it to us, and a version the ABOUT page invents is
    worse than none. */
-#define LS_HEAD_VERSION "v2.7"
+#define LS_HEAD_VERSION "v2.9"
 #include "ls_cfg.h"
 #include "ls_dbg.h"
 
@@ -266,6 +267,7 @@ typedef enum {
     ECHO_REC_MINP,
     ECHO_REC_MAXSPAN,
     ECHO_REC_MINEDGES,
+    ECHO_REC_MOD,
     ECHO_COUNT,
 } LsEchoId;
 
@@ -368,6 +370,7 @@ typedef struct {
     char modal_l1[32];
     char modal_l2[32];
     uint32_t modal_until;
+    int modal_pct;
 
     char toast[40];
     uint32_t toast_until;
@@ -378,6 +381,9 @@ typedef struct {
     int rec_have;
     int rec_total;
     uint32_t rec_freq_hz;
+    int rec_mod;
+    uint32_t rec_dev_hz;
+    uint32_t rec_bitrate;
     uint32_t rec_expected_span_us;
     int rec_xfer;
 
@@ -390,6 +396,10 @@ typedef struct {
     uint32_t rec_files_deadline;
     bool rec_files_busy;
     int rec_files_retries;
+    int rec_files_base;
+    bool rec_files_active;
+    bool rec_files_restarted;
+    bool rec_files_sel_last;
 
     /* P25 SYSTEM page: the radio's PSYS status and its card profiles. */
     LsPsys psys;
@@ -409,6 +419,8 @@ typedef struct {
     int rec_load_idx;
     uint32_t rec_load_seq;
     uint32_t rec_load_deadline;
+    uint32_t rec_load_start;
+    char rec_load_name[LS_REC_NAME_MAX];
     char rec_open_path[96];
     bool rec_from_files;
     uint32_t rec_deadline;
@@ -444,6 +456,7 @@ static void modal_set(LsApp* app, const char* title, const char* l1, const char*
     snprintf(app->modal_l1, sizeof(app->modal_l1), "%s", l1 ? l1 : "");
     snprintf(app->modal_l2, sizeof(app->modal_l2), "%s", l2 ? l2 : "");
     app->modal_until = ms ? furi_get_tick() + furi_ms_to_ticks(ms) : 0;
+    app->modal_pct = -1;
 }
 
 static void modal_clear(LsApp* app) {
@@ -603,6 +616,7 @@ static const LsMem ADSB_PRESETS[] = {
 static const LsMem REC_PRESETS[] = {
     {"OOK 433.92", 433920000},
     {"FSK 432.80", 432800000},
+    {"Trap 433.42", 433420000},
     {"OOK 315.00", 315000000},
     {"OOK 345.00", 345000000},
     {"OOK 390.00", 390000000},
@@ -700,18 +714,22 @@ static void preset_load(LsApp* app) {
     ls_cfg_preset_path(path, sizeof(path), APPS[app->app].tag);
 
     int n = list_load(path, app->preset, PRESET_MAX);
-    if(n >= 0) {
+    bool dirty = n < 0;
+    if(n < 0) n = 0;
 
-        app->preset_count = n;
-        return;
+    /* Add any default missing by name, so a new default reaches an old file. */
+    for(int d = 0; d < PRESETS[app->app].count && n < PRESET_MAX; d++) {
+        const LsMem* def = &PRESETS[app->app].list[d];
+        bool have = false;
+        for(int i = 0; i < n && !have; i++) have = !strcmp(app->preset[i].name, def->name);
+        if(!have) {
+            app->preset[n++] = *def;
+            dirty = true;
+        }
     }
-
-    n = PRESETS[app->app].count;
-    if(n > PRESET_MAX) n = PRESET_MAX;
-    for(int i = 0; i < n; i++) app->preset[i] = PRESETS[app->app].list[i];
     app->preset_count = n;
 
-    list_save(path, app->preset, app->preset_count);
+    if(dirty) list_save(path, app->preset, app->preset_count);
 }
 
 static void mem_migrate_legacy(LsApp* app) {
@@ -904,8 +922,9 @@ static void rec_preview_clear(LsApp* app) {
    board grew names of its own, carrying one across is free and is the
    difference between picking a capture and guessing at a list of siblings.
    src_name is the board's name when this came from the browse page and NULL
-   when it is a live capture, which keeps the old counter for that case. */
-static bool rec_write_sub(LsApp* app, const char* src_name, char* name_out, size_t name_len) {
+   when it is a live capture, which keeps the old counter for that case.
+   Returns NULL on success, else what went wrong. */
+static const char* rec_write_sub(LsApp* app, const char* src_name, char* name_out, size_t name_len) {
     Storage* storage = furi_record_open(RECORD_STORAGE);
     storage_common_mkdir(storage, REC_SUB_ROOT);
     storage_common_mkdir(storage, REC_SUB_DIR);
@@ -940,37 +959,49 @@ static bool rec_write_sub(LsApp* app, const char* src_name, char* name_out, size
         }
     }
 
-    bool ok = false;
+    const char* err = "Save failed";
+    bool opened = false;
     Stream* stream = file_stream_alloc(storage);
     if(file_stream_open(stream, path, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
+        opened = true;
         FuriString* s = furi_string_alloc();
         furi_string_printf(
             s,
             "Filetype: Flipper SubGhz RAW File\n"
             "Version: 1\n"
-            "Frequency: %lu\n"
-            "Preset: FuriHalSubGhzPresetOok650Async\n"
-            "Protocol: RAW\n",
+            "Frequency: %lu\n",
             (unsigned long)app->rec_freq_hz);
-        stream_write_string(stream, s);
+        if(app->rec_mod == 1) {
+            uint8_t regs[LS_SUBFSK_REGS];
+            ls_subfsk_regs(regs, app->rec_dev_hz, app->rec_bitrate);
+            furi_string_cat_str(s, LS_SUBFSK_PRESET_HEAD);
+            for(int k = 0; k < LS_SUBFSK_REGS; k++) furi_string_cat_printf(s, " %02X", regs[k]);
+            furi_string_cat_str(s, "\n");
+        } else {
+            furi_string_cat_str(s, "Preset: FuriHalSubGhzPresetOok650Async\n");
+        }
+        furi_string_cat_str(s, "Protocol: RAW\n");
+        bool wrote = stream_write_string(stream, s) == furi_string_size(s);
 
         int i = 0;
-        while(i < app->rec_have) {
+        while(wrote && i < app->rec_have) {
             furi_string_set_str(s, "RAW_Data:");
             for(int k = 0; k < REC_LINE_VALUES && i < app->rec_have; k++, i++) {
                 furi_string_cat_printf(s, " %ld", (long)app->rec_buf[i]);
             }
             furi_string_cat_str(s, "\n");
-            stream_write_string(stream, s);
+            wrote = stream_write_string(stream, s) == furi_string_size(s);
         }
         furi_string_free(s);
-        ok = true;
+        err = wrote ? NULL : "Write failed";
     }
 
     file_stream_close(stream);
     stream_free(stream);
+    if(opened && err) storage_simply_remove(storage, path);
     furi_record_close(RECORD_STORAGE);
 
+    const bool ok = err == NULL;
     if(ok) {
         snprintf(app->rec_open_path, sizeof(app->rec_open_path), "%s", path);
     }
@@ -985,16 +1016,17 @@ static bool rec_write_sub(LsApp* app, const char* src_name, char* name_out, size
         memcpy(name_out, base, n);
         name_out[n] = '\0';
     }
-    return ok;
+    return err;
 }
 
 static void rec_xfer_start(LsApp* app);
 static void rec_xfer_start_capture(LsApp* app, int total, uint32_t freq_hz, uint32_t expected_span_us);
 
-/* Browsing the board's saved set. The board answers one entry per request
-, so this is a small pump: ask for index N, take the row, ask for
-   N+1, stop at total. A timeout just re-asks the same index - the reply is
-   idempotent, so a late duplicate costs nothing. */
+/* Browsing the board's saved set, newest first. The board answers one entry
+   per request, so this is a small pump: ask for index N, take the row, ask for
+   N+1, stop at the window or the total. REC LS 0 makes the board take a fresh
+   snapshot and later indices come from it, so a window is only ever fetched
+   from its base upward. A timeout just re-asks the same index. */
 #define REC_FILES_TIMEOUT_MS 800
 
 static void rec_files_request(LsApp* app, int index) {
@@ -1003,16 +1035,31 @@ static void rec_files_request(LsApp* app, int index) {
     app->rec_files_deadline = furi_get_tick() + furi_ms_to_ticks(REC_FILES_TIMEOUT_MS);
 }
 
+static void rec_files_fetch(LsApp* app, int base, bool sel_last) {
+    app->rec_files_base = base < 0 ? 0 : base;
+    app->rec_files_n = 0;
+    app->rec_files_sel = 0;
+    app->rec_files_top = 0;
+    app->rec_files_sel_last = sel_last;
+    app->rec_files_retries = 0;
+    app->rec_files_busy = true;
+    rec_files_request(app, app->rec_files_base);
+}
+
 static void rec_files_refresh(LsApp* app) {
     if(!app->link_up) {
         toast(app, "No radio");
         return;
     }
-    app->rec_files_n = 0;
     app->rec_files_total = 0;
-    app->rec_files_retries = 0;
-    app->rec_files_busy = true;
-    rec_files_request(app, 0);
+    app->rec_files_restarted = false;
+    rec_files_fetch(app, 0, false);
+}
+
+static void rec_files_done(LsApp* app) {
+    app->rec_files_busy = false;
+    app->rec_files_sel = app->rec_files_sel_last ? app->rec_files_n - 1 : 0;
+    if(app->rec_files_sel < 0) app->rec_files_sel = 0;
 }
 
 static void rec_files_tick(LsApp* app) {
@@ -1024,13 +1071,26 @@ static void rec_files_tick(LsApp* app) {
     char name[LS_REC_NAME_MAX];
 
     if(ls_link_rec_file_take(app->link, &index, &total, &freq, &size, name, sizeof(name))) {
+        if(index != app->rec_files_want) return;
         app->rec_files_total = total;
 
-        if(total <= 0 || name[0] == '\0') {
-            app->rec_files_busy = false;
+        if(total <= 0) {
+            app->rec_files_n = 0;
+            rec_files_done(app);
             return;
         }
-        if(index == app->rec_files_want && app->rec_files_n < REC_FILES_MAX) {
+        if(name[0] == '\0') {
+            /* A hole before the total: the snapshot moved under us. */
+            if(index < total && !app->rec_files_restarted) {
+                app->rec_files_restarted = true;
+                modal_set(app, "FILES", "Board list changed", "refreshing", 1500);
+                rec_files_fetch(app, 0, false);
+                return;
+            }
+            rec_files_done(app);
+            return;
+        }
+        if(app->rec_files_n < REC_FILES_MAX) {
             RecFileEntry* e = &app->rec_files[app->rec_files_n++];
             strncpy(e->name, name, sizeof(e->name) - 1);
             e->name[sizeof(e->name) - 1] = '\0';
@@ -1038,12 +1098,11 @@ static void rec_files_tick(LsApp* app) {
             e->size = size;
         }
         app->rec_files_retries = 0;
-        if(app->rec_files_n < total && app->rec_files_n < REC_FILES_MAX) {
-            rec_files_request(app, app->rec_files_n);
+        const int next = app->rec_files_base + app->rec_files_n;
+        if(app->rec_files_n < REC_FILES_MAX && next < total) {
+            rec_files_request(app, next);
         } else {
-            app->rec_files_busy = false;
-            if(app->rec_files_sel >= app->rec_files_n) app->rec_files_sel = app->rec_files_n - 1;
-            if(app->rec_files_sel < 0) app->rec_files_sel = 0;
+            rec_files_done(app);
         }
         return;
     }
@@ -1053,12 +1112,39 @@ static void rec_files_tick(LsApp* app) {
            counter would carry a partial failure into the next refresh and trip
            the limit early on a link that had already recovered. */
         if(++app->rec_files_retries > 4) {
-            app->rec_files_busy = false;
+            rec_files_done(app);
             toast(app, "List timed out");
             return;
         }
         rec_files_request(app, app->rec_files_want);
     }
+}
+
+/* Scroll past either end of the window into the next or previous one. */
+static void rec_files_move(LsApp* app, int dir) {
+    if(dir < 0) {
+        if(app->rec_files_sel > 0)
+            app->rec_files_sel--;
+        else if(app->rec_files_base > 0)
+            rec_files_fetch(app, app->rec_files_base - REC_FILES_MAX, true);
+    } else {
+        if(app->rec_files_sel < app->rec_files_n - 1)
+            app->rec_files_sel++;
+        else if(app->rec_files_base + app->rec_files_n < app->rec_files_total)
+            rec_files_fetch(app, app->rec_files_base + app->rec_files_n, false);
+    }
+}
+
+/* Refresh each time the page is entered, once the radio is there. */
+static void rec_files_page_tick(LsApp* app) {
+    const bool on_page = app->screen == LsScreenApp && cur_page(app) == PG_REC_FILES;
+    if(!on_page) {
+        app->rec_files_active = false;
+        return;
+    }
+    if(app->rec_files_active || !app->link_up) return;
+    app->rec_files_active = true;
+    if(app->rec_load_idx < 0 && app->rec_xfer == RecXferIdle) rec_files_refresh(app);
 }
 
 /* Wait for the selected file's fresh load acknowledgement. A cached DONE
@@ -1075,13 +1161,17 @@ static void rec_files_load_selected(LsApp* app) {
         toast(app, "Nothing saved");
         return;
     }
-    if(app->rec_xfer != RecXferIdle) return;
+    if(app->rec_xfer != RecXferIdle || app->rec_load_idx >= 0 || app->rec_files_busy) return;
 
+    const RecFileEntry* e = &app->rec_files[clampi(app->rec_files_sel, 0, app->rec_files_n - 1)];
+    snprintf(app->rec_load_name, sizeof(app->rec_load_name), "%s", e->name);
     app->rec_load_seq = ls_link_rec_load_reply(app->link, NULL);
-    app->rec_load_idx = app->rec_files_sel;
-    app->rec_load_deadline = furi_get_tick() + furi_ms_to_ticks(REC_LOAD_TIMEOUT_MS);
-    ls_link_send(app->link, "REC LOAD %d", app->rec_files_sel);
-    toast(app, "Loading...");
+    app->rec_load_idx = app->rec_files_base + app->rec_files_sel;
+    app->rec_load_start = furi_get_tick();
+    app->rec_load_deadline = app->rec_load_start + furi_ms_to_ticks(REC_LOAD_TIMEOUT_MS);
+    ls_link_send(app->link, "REC LOAD %d", app->rec_load_idx);
+    modal_set(app, "LOADING", app->rec_load_name, NULL, 0);
+    app->modal_pct = 0;
 }
 
 static void rec_files_load_tick(LsApp* app) {
@@ -1091,14 +1181,23 @@ static void rec_files_load_tick(LsApp* app) {
     uint32_t seq = ls_link_rec_load_reply(app->link, &ack);
     if(ls_rec_load_ack_ready(&ack, seq, app->rec_load_seq, app->rec_load_idx)) {
         app->rec_load_idx = -1;
+        modal_clear(app);
         app->rec_from_files = true;
+        app->rec_mod = ack.mod;
+        app->rec_dev_hz = ack.dev_hz;
+        app->rec_bitrate = ack.bitrate;
         rec_xfer_start_capture(app, ack.edges, ack.freq_hz, ack.span_us);
         return;
     }
-    if(furi_get_tick() > app->rec_load_deadline) {
+    const uint32_t now = furi_get_tick();
+    if(now > app->rec_load_deadline) {
         app->rec_load_idx = -1;
+        modal_clear(app);
         toast(app, "Load failed");
+        return;
     }
+    app->modal_pct =
+        clampi((int)((now - app->rec_load_start) * 100 / furi_ms_to_ticks(REC_LOAD_TIMEOUT_MS)), 0, 100);
 }
 
 /* Hand the freshly written .sub straight to the stock Sub-GHz app. A running
@@ -1130,7 +1229,13 @@ static void rec_xfer_start(LsApp* app) {
         toast(app, "Still capturing");
         return;
     }
-    rec_xfer_start_capture(app, (int)app->tel.rec_edges, app->tel.freq_hz, 0);
+    const LsTelemetry* t = &app->tel;
+    app->rec_from_files = false;
+    app->rec_mod = t->rec_mod == 1 ? 1 : 0;
+    app->rec_dev_hz = t->rec_dev_hz;
+    app->rec_bitrate = t->rec_bitrate;
+    rec_xfer_start_capture(
+        app, (int)t->rec_edges, t->rec_cap_freq_hz ? t->rec_cap_freq_hz : t->freq_hz, 0);
 }
 
 static void rec_xfer_start_capture(LsApp* app, int total, uint32_t freq_hz, uint32_t expected_span_us) {
@@ -1190,20 +1295,17 @@ static void rec_xfer_finish(LsApp* app) {
     modal_clear(app);
 
     char name[40];
-    const char* src = NULL;
-    if(app->rec_from_files && app->rec_files_sel >= 0 &&
-       app->rec_files_sel < app->rec_files_n) {
-        src = app->rec_files[app->rec_files_sel].name;
-    }
+    const char* src = app->rec_from_files ? app->rec_load_name : NULL;
     app->rec_from_files = false;
 
-    if(app->rec_have > 0 && rec_write_sub(app, src, name, sizeof(name))) {
+    const char* err = app->rec_have > 0 ? rec_write_sub(app, src, name, sizeof(name)) : "Save failed";
+    if(!err) {
         snprintf(app->rec_file, sizeof(app->rec_file), "%s", name);
         modal_set(app, "SAVED", name, "OK: open in SubGHz", 3000);
         ls_alert(app, LsAlertCapture);
     } else {
         rec_preview_clear(app);
-        toast(app, "Save failed");
+        toast(app, "%s", err);
     }
 }
 
@@ -2203,6 +2305,7 @@ static void draw_adsb_stat(Canvas* c, LsApp* app) {
 typedef enum {
     REC_ROW_ARM,
     REC_ROW_FREQ,
+    REC_ROW_MOD,
     REC_ROW_GAIN,
     REC_ROW_THRESH,
     REC_ROW_GAP,
@@ -2222,6 +2325,9 @@ static void rec_row_value(LsApp* app, int row, char* out, size_t len) {
         break;
     case REC_ROW_FREQ:
         ls_ui_mhz(out, len, t->freq_hz);
+        break;
+    case REC_ROW_MOD:
+        snprintf(out, len, "%s", echo_get(app, ECHO_REC_MOD, t->rec_mod) == 1 ? "FSK" : "OOK");
         break;
     case REC_ROW_GAIN: {
         int32_t g = echo_get(app, ECHO_GAIN, t->gain_tenths);
@@ -2326,6 +2432,7 @@ static void draw_rec(Canvas* c, LsApp* app) {
     static const char* const LABELS[REC_ROW_COUNT] = {
         "Record",
         "Freq",
+        "Mod",
         "Gain",
         "Thresh",
         "Gap",
@@ -2345,7 +2452,7 @@ static void draw_rec(Canvas* c, LsApp* app) {
         rec_row_value(app, i, v, sizeof(v));
         int y = body_top() + r * LS_ROW_H;
 
-        if(i == REC_ROW_ARM) {
+        if(i == REC_ROW_ARM || i == REC_ROW_MOD) {
             ls_ui_row(c, y, LABELS[i], v, i == app->focus);
         } else {
             ls_ui_row_edit(
@@ -2400,13 +2507,32 @@ static void draw_rec_cap(Canvas* c, LsApp* app) {
     char v[32];
     int y = body_top();
 
-    snprintf(v, sizeof(v), "%ld", (long)t->rec_edges);
-    ls_ui_row(c, y, "Edges", v, false);
-    y += LS_ROW_H;
+    if(t->rec_mod == 1 && t->rec_dev_hz > 0) {
+        snprintf(
+            v,
+            sizeof(v),
+            "%lu.%luk",
+            (unsigned long)(t->rec_dev_hz / 1000),
+            (unsigned long)(t->rec_dev_hz % 1000 / 100));
+        ls_ui_row(c, y, "FSK dev", v, false);
+        y += LS_ROW_H;
+        snprintf(
+            v,
+            sizeof(v),
+            "%ld / %lu ms",
+            (long)t->rec_edges,
+            (unsigned long)(t->rec_span_us / 1000));
+        ls_ui_row(c, y, "Edges", v, false);
+        y += LS_ROW_H;
+    } else {
+        snprintf(v, sizeof(v), "%ld", (long)t->rec_edges);
+        ls_ui_row(c, y, "Edges", v, false);
+        y += LS_ROW_H;
 
-    snprintf(v, sizeof(v), "%lu ms", (unsigned long)(t->rec_span_us / 1000));
-    ls_ui_row(c, y, "Span", v, false);
-    y += LS_ROW_H;
+        snprintf(v, sizeof(v), "%lu ms", (unsigned long)(t->rec_span_us / 1000));
+        ls_ui_row(c, y, "Span", v, false);
+        y += LS_ROW_H;
+    }
 
     if(app->rec_buf && app->rec_have > 0) {
         draw_rec_wave(c, app, 2, y + 1, canvas_width(c) - 4, 10);
@@ -3095,8 +3221,19 @@ static uint32_t edit_value(LsApp* app) {
 
 
 static void draw_rec_files(Canvas* c, LsApp* app) {
-    if(app->rec_files_busy && app->rec_files_n == 0) {
-        ls_ui_empty(c, "Reading board...", "");
+    if(app->rec_files_busy) {
+        const int total = app->rec_files_total;
+        const int want = total > 0 ? clampi(total - app->rec_files_base, 1, REC_FILES_MAX) : 1;
+        char l[32];
+        if(total > 0)
+            snprintf(l, sizeof(l), "Loading %d/%d", app->rec_files_base + app->rec_files_n, total);
+        else
+            snprintf(l, sizeof(l), "Reading board...");
+        const int w = canvas_width(c);
+        const int mid = (LS_HDR_H + canvas_height(c)) / 2;
+        canvas_set_font(c, FontSecondary);
+        canvas_draw_str_aligned(c, w / 2, mid - 2, AlignCenter, AlignBottom, l);
+        ls_ui_bar(c, 8, mid + 2, w - 16, 7, app->rec_files_n * 100 / want);
         return;
     }
     if(app->rec_files_n <= 0) {
@@ -3116,6 +3253,18 @@ static void draw_rec_files(Canvas* c, LsApp* app) {
         ls_ui_row(c, y, e->name, mhz, i == app->rec_files_sel);
         y += LS_ROW_H;
     }
+    const int total = app->rec_files_total > app->rec_files_n ? app->rec_files_total :
+                                                                app->rec_files_n;
+    elements_scrollbar(c, app->rec_files_base + app->rec_files_sel, total);
+}
+
+/* "FILES 3/57" once there is a list to be in. */
+static const char* rec_files_title(LsApp* app, char* buf, size_t len, bool portrait) {
+    if(app->rec_files_busy || app->rec_files_n <= 0) return "FILES";
+    const int pos = app->rec_files_base + app->rec_files_sel + 1;
+    const int total = app->rec_files_total > 0 ? app->rec_files_total : app->rec_files_n;
+    snprintf(buf, len, portrait ? "%d/%d" : "FILES %d/%d", pos, total);
+    return buf;
 }
 
 /* P25 SYSTEM. PSYS every two seconds while the page is up, and the card's
@@ -3476,16 +3625,20 @@ static void draw_cb(Canvas* c, void* ctx) {
         ls_ui_header(c, "LAKESHARK", 0, 1, app->link_up, transport_badge(app));
         draw_launcher(c, app);
         break;
-    case LsScreenApp:
+    case LsScreenApp: {
+        char title[20];
         ls_ui_header(
             c,
-            page_title(app),
+            cur_page(app) == PG_REC_FILES ?
+                rec_files_title(app, title, sizeof(title), ls_ui_portrait(c)) :
+                page_title(app),
             app->page,
             APPS[app->app].n_pages,
             app->link_up,
             transport_badge(app));
         draw_app_page(c, app);
         break;
+    }
     case LsScreenSettings:
         ls_ui_header(
             c,
@@ -3513,7 +3666,10 @@ static void draw_cb(Canvas* c, void* ctx) {
     }
 
     if(modal_active(app)) {
-        ls_ui_modal(c, app->modal_title, app->modal_l1, app->modal_l2);
+        if(app->modal_pct >= 0)
+            ls_ui_modal_progress(c, app->modal_title, app->modal_l1, app->modal_pct);
+        else
+            ls_ui_modal(c, app->modal_title, app->modal_l1, app->modal_l2);
     } else if(app->toast[0] && furi_get_tick() < app->toast_until) {
         ls_ui_toast(c, app->toast);
     }
@@ -3683,6 +3839,12 @@ static void rec_adjust(LsApp* app, int row, int dir) {
     case REC_ROW_FREQ:
         vfo_tune(app, dir);
         break;
+    case REC_ROW_MOD: {
+        const int v = echo_get(app, ECHO_REC_MOD, t->rec_mod) == 1 ? 0 : 1;
+        ls_link_send(app->link, "REC MOD %s", v ? "FSK" : "OOK");
+        echo_set(app, ECHO_REC_MOD, v);
+        break;
+    }
     case REC_ROW_GAIN:
         adjust_gain(app, dir);
         break;
@@ -3977,6 +4139,13 @@ static void handle_app(LsApp* app, InputEvent* ev, bool press) {
         return;
     }
 
+    /* Mod has two values, so Left and Right flip it instead of the page. */
+    if(pg == PG_REC && app->focus == REC_ROW_MOD && ev->type == InputTypeShort &&
+       (ev->key == InputKeyLeft || ev->key == InputKeyRight)) {
+        rec_adjust(app, REC_ROW_MOD, 1);
+        return;
+    }
+
     if(press && ev->key == InputKeyRight) {
         app->page = (app->page + 1) % d->n_pages;
         app->focus = 0;
@@ -4117,7 +4286,10 @@ static void handle_app(LsApp* app, InputEvent* ev, bool press) {
 
     case PG_DIAG:
         if(ok) ls_link_send(app->link, "PING");
-        if(ok_long) ls_link_selftest(app->link);
+        if(ok_long) {
+            ls_link_selftest(app->link);
+            toast(app, ls_subfsk_selftest() ? "Self-test done" : "FSK check FAIL");
+        }
         break;
 
     case PG_FM_SCAN:
@@ -4199,6 +4371,8 @@ static void handle_app(LsApp* app, InputEvent* ev, bool press) {
         if(ok) {
             if(app->focus == REC_ROW_ARM) {
                 rec_toggle_arm(app);
+            } else if(app->focus == REC_ROW_MOD) {
+                rec_adjust(app, REC_ROW_MOD, 1);
             } else {
                 app->editing = true;
             }
@@ -4239,8 +4413,10 @@ static void handle_app(LsApp* app, InputEvent* ev, bool press) {
             toast(app, "Preview cleared");
         }
         break;
-    case PG_REC_FILES:
-        if(ok) {
+    case PG_REC_FILES: {
+        const bool idle =
+            !app->rec_files_busy && app->rec_load_idx < 0 && app->rec_xfer == RecXferIdle;
+        if(ok && idle) {
             if(app->rec_files_n <= 0)
                 rec_files_refresh(app);
             else
@@ -4249,9 +4425,10 @@ static void handle_app(LsApp* app, InputEvent* ev, bool press) {
         /* Long OK is the shortcut the SubGHz browse was making painful: it
            hands the last file this app wrote straight to the stock app. */
         if(ok_long) rec_open_in_subghz(app);
-        if(up && app->rec_files_sel > 0) app->rec_files_sel--;
-        if(down && app->rec_files_sel < app->rec_files_n - 1) app->rec_files_sel++;
+        if(idle && up) rec_files_move(app, -1);
+        if(idle && down) rec_files_move(app, +1);
         break;
+    }
     case PG_P25_SYS:
         p25_sys_input(app, up, down, ok, ok_long);
         break;
@@ -4426,6 +4603,10 @@ static void handle_input(LsApp* app, InputEvent* ev) {
         if(ev->type == InputTypeShort &&
            (ev->key == InputKeyBack || ev->key == InputKeyOk)) {
             if(app->rec_xfer == RecXferActive) rec_xfer_cancel(app, "Transfer cancelled");
+            if(app->rec_load_idx >= 0) {
+                app->rec_load_idx = -1;
+                toast(app, "Load cancelled");
+            }
             modal_clear(app);
             app->pending_mode[0] = '\0';
         }
@@ -4588,6 +4769,7 @@ int32_t lakeshark_p25_app(void* p) {
         }
 
         rec_xfer_tick(app);
+        rec_files_page_tick(app);
         rec_files_tick(app);
         p25_sys_tick(app);
         rec_files_load_tick(app);

@@ -244,6 +244,14 @@ void ls_ui_modal(Canvas* c, const char* title, const char* line1, const char* li
     }
 }
 
+/* The two-line modal with a bar in place of its second line. */
+void ls_ui_modal_progress(Canvas* c, const char* title, const char* line1, int pct) {
+    ls_ui_modal(c, title, line1, " ");
+    const int w = canvas_width(c);
+    const int y = canvas_height(c) / 2 - 23;
+    ls_ui_bar(c, 12, y + 32, w - 24, 7, pct);
+}
+
 void ls_ui_toast(Canvas* c, const char* text) {
     canvas_set_font(c, FontSecondary);
     const int cw = canvas_width(c);
