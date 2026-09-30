@@ -1,3 +1,7 @@
+v2.9:
+REC records FSK. The record page has a Mod row for OOK or FSK, and an FSK capture is saved with a CC1101 2-FSK preset set to the deviation and bit rate the radio measured, so it replays from the SubGHz app. The capture page shows the measured deviation, and a live capture is saved at the frequency it was taken on. Added a Trap 433.42 preset; new default presets are added to an existing preset list.
+FILES reads the radio's list every time it opens, newest first, with a progress bar, its position in the header and a scrollbar, and pages through any number of captures. A download is saved under the name of the file that was loaded, and a card write error says Write failed instead of SAVED. Needs LakeShark firmware with REC MOD.
+
 v2.8:
 Settings, Levels has a Voice row that sets the radio's speech level, as a share of Vol, in steps of 5. It shows the radio's own level once the radio reports it; that needs LakeShark 2.5.0.
 Opening the app is reliable after a long session. The ADS-B map now loads only on its own page and gives its memory back when you leave it, and every large allocation checks that the heap can spare it first.
