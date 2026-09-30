@@ -422,6 +422,11 @@ typedef struct {
     uint32_t rec_load_start;
     char rec_load_name[LS_REC_NAME_MAX];
     char rec_open_path[96];
+    /* The capture rec_open_path holds, so OK on CAPTURE plays it instead
+       of saving the same capture again. */
+    uint32_t rec_saved_captures;
+    int32_t rec_saved_edges;
+    bool rec_saved_valid;
     bool rec_from_files;
     uint32_t rec_deadline;
     int rec_retries;
@@ -1219,6 +1224,14 @@ static void rec_open_in_subghz(LsApp* app) {
     app->running = false;
 }
 
+/* True while the board still holds the capture last saved here. A new
+   capture bumps the board's counter; a FILES load changes the edge count. */
+static bool rec_capture_saved(LsApp* app) {
+    return app->rec_saved_valid && app->rec_open_path[0] &&
+           app->tel.rec_captures == app->rec_saved_captures &&
+           app->tel.rec_edges == app->rec_saved_edges;
+}
+
 static void rec_xfer_request(LsApp* app) {
     ls_link_send(app->link, "REC GET %d", app->rec_have);
     app->rec_deadline = furi_get_tick() + furi_ms_to_ticks(REC_XFER_TIMEOUT_MS);
@@ -1301,7 +1314,11 @@ static void rec_xfer_finish(LsApp* app) {
     const char* err = app->rec_have > 0 ? rec_write_sub(app, src, name, sizeof(name)) : "Save failed";
     if(!err) {
         snprintf(app->rec_file, sizeof(app->rec_file), "%s", name);
-        modal_set(app, "SAVED", name, "OK: open in SubGHz", 3000);
+        app->rec_saved_captures = app->tel.rec_captures;
+        app->rec_saved_edges = app->tel.rec_edges;
+        app->rec_saved_valid = true;
+        /* No timeout: the dialog offers a choice, so it waits for one. */
+        modal_set(app, "SAVED", name, "OK play  Back stay", 0);
         ls_alert(app, LsAlertCapture);
     } else {
         rec_preview_clear(app);
@@ -2536,7 +2553,7 @@ static void draw_rec_cap(Canvas* c, LsApp* app) {
 
     if(app->rec_buf && app->rec_have > 0) {
         draw_rec_wave(c, app, 2, y + 1, canvas_width(c) - 4, 10);
-        draw_status_line(c, app->rec_file[0] ? app->rec_file : "OK saves .sub");
+        draw_status_line(c, rec_capture_saved(app) ? "OK play  hold clear" : "OK saves .sub");
     } else if(t->rec_phase == LsRecDone && t->rec_edges > 0) {
         canvas_draw_str(c, 2, y + 9, "OK to save to SubGHz");
         draw_status_line(c, "OK saves .sub");
@@ -4407,9 +4424,15 @@ static void handle_app(LsApp* app, InputEvent* ev, bool press) {
         break;
 
     case PG_REC_CAP:
-        if(ok) rec_xfer_start(app);
+        if(ok) {
+            if(rec_capture_saved(app))
+                rec_open_in_subghz(app);
+            else
+                rec_xfer_start(app);
+        }
         if(ok_long) {
             rec_preview_clear(app);
+            app->rec_saved_valid = false;
             toast(app, "Preview cleared");
         }
         break;
@@ -4600,6 +4623,12 @@ static void handle_input(LsApp* app, InputEvent* ev) {
     bool press = (ev->type == InputTypeShort) || (ev->type == InputTypeRepeat);
 
     if(modal_active(app)) {
+        if(ev->type == InputTypeShort && ev->key == InputKeyOk &&
+           !strcmp(app->modal_title, "SAVED")) {
+            modal_clear(app);
+            rec_open_in_subghz(app);
+            return;
+        }
         if(ev->type == InputTypeShort &&
            (ev->key == InputKeyBack || ev->key == InputKeyOk)) {
             if(app->rec_xfer == RecXferActive) rec_xfer_cancel(app, "Transfer cancelled");
