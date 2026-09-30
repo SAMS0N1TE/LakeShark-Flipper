@@ -11,6 +11,9 @@ typedef struct {
     int edges;
     uint32_t span_us;
     uint32_t freq_hz;
+    int mod; /* 0 OOK, 1 FSK */
+    uint32_t dev_hz;
+    uint32_t bitrate;
 } LsRecLoadAck;
 
 /* "<key>=<digits>" at *p, no sign, no wider than 32 bits. Hand-rolled because
@@ -34,6 +37,12 @@ static inline bool ls_rec_load_ack_field(const char** p, const char* key, uint32
     return true;
 }
 
+/* Optional trailing " <key><digits>" anywhere after p; absent leaves *out. */
+static inline void ls_rec_load_ack_opt(const char* p, const char* key, uint32_t* out) {
+    const char* at = strstr(p, key);
+    if(at) ls_rec_load_ack_field(&at, key, out);
+}
+
 /* Only a completed REC LOAD acknowledgement can start a file transfer.
  * Uncorrelated status replies and cached DONE telemetry are not acknowledgements. */
 static inline bool ls_rec_load_ack_parse(const char* line, LsRecLoadAck* out) {
@@ -45,7 +54,12 @@ static inline bool ls_rec_load_ack_parse(const char* line, LsRecLoadAck* out) {
        !ls_rec_load_ack_field(&p, " sp=", &span) ||
        !ls_rec_load_ack_field(&p, " f=", &freq) || index > INT_MAX ||
        phase > 3 || edges > 4096 || freq == 0) return false;
-    *out = (LsRecLoadAck){(int)index, (int)phase, (int)edges, (uint32_t)span, (uint32_t)freq};
+    uint32_t mod = 0, dev = 0, br = 0;
+    ls_rec_load_ack_opt(p, " mo=", &mod);
+    ls_rec_load_ack_opt(p, " dv=", &dev);
+    ls_rec_load_ack_opt(p, " br=", &br);
+    *out = (LsRecLoadAck){
+        (int)index, (int)phase, (int)edges, span, freq, mod ? 1 : 0, dev, br};
     return true;
 }
 

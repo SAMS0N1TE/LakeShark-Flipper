@@ -5,6 +5,7 @@
 #include <furi_hal_bt.h>
 #include "ls_ble_profile.h"
 #include "ls_dbg.h"
+#include "ls_subfsk.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -329,6 +330,14 @@ static void apply_kv(LsTelemetry* t, char* tok) {
         t->rec_baud_est = (uint32_t)strtoul(v, NULL, 10);
     else if((v = kv(tok, "rlf")))
         copy_field(t->rec_last_file, sizeof(t->rec_last_file), v);
+    else if((v = kv(tok, "rmo")))
+        t->rec_mod = atoi(v);
+    else if((v = kv(tok, "rdv")))
+        t->rec_dev_hz = (uint32_t)strtoul(v, NULL, 10);
+    else if((v = kv(tok, "rcf")))
+        t->rec_cap_freq_hz = (uint32_t)strtoul(v, NULL, 10);
+    else if((v = kv(tok, "rbr")))
+        t->rec_bitrate = (uint32_t)strtoul(v, NULL, 10);
 
     else if((v = kv(tok, "ac")))
         t->ac_tracked = atoi(v);
@@ -891,7 +900,7 @@ void ls_link_selftest(LsLink* link) {
                   "aci=0 acn=3 a0=A4E1BF,UAL123,35000,470,271,0,850,42 "
                   "a1=AB12CD,-,12250,220,88,-1200,1500,7 "
                   "a2=3C6444,DLH44,38000,505,95,0,300,61 "
-                  "up=3601 fi=14100 fd=3300";
+                  "up=3601 fi=14100 fd=3300 rmo=1 rdv=19043 rcf=433420000 rbr=2400";
     handle_line(link, adsb);
 
     LsTelemetry* tp = malloc(sizeof(LsTelemetry));
@@ -937,6 +946,23 @@ void ls_link_selftest(LsLink* link) {
         (unsigned long)tp->uptime_s,
         (unsigned long)tp->free_internal,
         (unsigned long)tp->free_dma);
+
+    LsRecLoadAck ack;
+    const bool ack_ok =
+        ls_rec_load_ack_parse(
+            "+OK load=3 ph=3 e=250 sp=290459 f=433420000 th=0 mo=1 dv=19043 br=2400", &ack) &&
+        ack.mod == 1 && ack.dev_hz == 19043 && ack.bitrate == 2400 &&
+        ls_rec_load_ack_parse("+OK load=3 ph=3 e=250 sp=290459 f=433420000 th=0", &ack) &&
+        ack.mod == 0 && ack.dev_hz == 0;
+    FURI_LOG_I(
+        TAG,
+        "selftest rec mo=%ld dv=%lu cf=%lu br=%lu ack=%s fsk=%s",
+        (long)tp->rec_mod,
+        (unsigned long)tp->rec_dev_hz,
+        (unsigned long)tp->rec_cap_freq_hz,
+        (unsigned long)tp->rec_bitrate,
+        ack_ok ? "ok" : "FAIL",
+        ls_subfsk_selftest() ? "ok" : "FAIL");
 
     free(tp);
 }

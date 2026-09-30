@@ -24,6 +24,10 @@ int main(void) {
     assert(!ls_rec_load_ack_ready(&a, 10, 9, 0));
     assert(ls_rec_load_ack_parse("+OK load=0 ph=3 e=0 sp=0 f=1", &a));
     assert(!ls_rec_load_ack_ready(&a, 10, 9, 0));
+    assert(ls_rec_load_ack_parse("+OK load=2 ph=3 e=250 sp=1 f=433420000 th=0 me=8 mo=1 dv=19043 br=2400", &a));
+    assert(a.index == 2 && a.mod == 1 && a.dev_hz == 19043 && a.bitrate == 2400);
+    assert(ls_rec_load_ack_parse("+OK load=2 ph=3 e=250 sp=1 f=433420000 th=0 me=8", &a));
+    assert(a.mod == 0 && a.dev_hz == 0 && a.bitrate == 0);
     return 0;
 }
 """

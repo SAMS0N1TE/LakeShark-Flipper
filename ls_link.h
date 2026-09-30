@@ -157,6 +157,10 @@ typedef struct {
     uint32_t rec_max_mark_us;
     uint32_t rec_baud_est;
     char rec_last_file[24];
+    int32_t rec_mod; /* 0 OOK, 1 FSK */
+    uint32_t rec_dev_hz;
+    uint32_t rec_cap_freq_hz;
+    uint32_t rec_bitrate;
 
     int32_t ac_tracked;
     int32_t ac_count;
