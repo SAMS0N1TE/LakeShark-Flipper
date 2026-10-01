@@ -106,6 +106,7 @@ typedef enum {
     PG_REC_SIG,
     PG_REC_CAP,
     PG_REC_FILES,
+    PG_REC_SCAN,
     PG_P25_SYS,
 } LsPage;
 
@@ -124,7 +125,7 @@ static const LsPage POC_PAGES[] = {PG_POC, PG_VFO, PG_POC_LOG, PG_MEM, PG_SIGNAL
 static const LsPage ADSB_PAGES[] =
     {PG_TRAFFIC, PG_AIRCRAFT, PG_ADSB_MAP, PG_ADSB_STAT, PG_SIGNAL, PG_DIAG};
 static const LsPage REC_PAGES[] = {
-    PG_REC, PG_REC_SIG, PG_REC_CAP, PG_REC_FILES, PG_MEM, PG_DIAG};
+    PG_REC, PG_REC_SCAN, PG_REC_SIG, PG_REC_CAP, PG_REC_FILES, PG_MEM, PG_DIAG};
 
 static const LsAppDef APPS[LsRadioCount] = {
     {"P25", "p25", "MODE p25", P25_PAGES, (int)(sizeof(P25_PAGES) / sizeof(LsPage))},
@@ -268,6 +269,7 @@ typedef enum {
     ECHO_REC_MAXSPAN,
     ECHO_REC_MINEDGES,
     ECHO_REC_MOD,
+    ECHO_REC_FREQ,
     ECHO_COUNT,
 } LsEchoId;
 
@@ -376,6 +378,12 @@ typedef struct {
     uint32_t toast_until;
 
     uint32_t flash_until;
+
+    /* REC frequency typed or stepped here, sent once the keys go quiet. */
+    bool rec_freq_dirty;
+    uint32_t rec_freq_due;
+    uint8_t key_repeat;
+    int sweep_band;
 
     int32_t* rec_buf;
     int rec_have;
@@ -1905,6 +1913,108 @@ static void draw_diag(Canvas* c, LsApp* app) {
     draw_status_line(c, rep);
 }
 
+/* Where the SCAN page looks. The SX1262 covers 150-960 MHz. */
+typedef struct {
+    const char* name;
+    uint32_t lo, hi;
+} LsSweepBand;
+
+static const LsSweepBand SWEEP_BANDS[] = {
+    {"300-348", 300000000u, 348000000u},
+    {"387-464", 387000000u, 464000000u},
+    {"433 ISM", 433050000u, 434790000u},
+    {"450-470", 450000000u, 470000000u},
+    {"862-870", 862000000u, 870000000u},
+    {"902-928", 902000000u, 928000000u},
+};
+#define SWEEP_BAND_COUNT ((int)(sizeof(SWEEP_BANDS) / sizeof(SWEEP_BANDS[0])))
+#define SWEEP_MIN_HZ     150000000u
+#define SWEEP_MAX_HZ     960000000u
+#define SWEEP_ZOOM_HZ    1000000u
+#define SWEEP_USE_BIN_HZ 150000u
+/* Bar height at this many dB above the floor. */
+#define SWEEP_FULL_DB    40
+
+static uint32_t sweep_bin_hz(const LsSweep* s) {
+    return s->n > 1 ? (s->hi_hz - s->lo_hz) / (uint32_t)(s->n - 1) : 0;
+}
+
+/* A recorded detection outlasts the live peak, which decays. */
+static uint32_t sweep_target(const LsSweep* s) {
+    return s->hit_hz ? s->hit_hz : (s->n ? s->pk_hz : 0);
+}
+
+static void sweep_mhz1(char* out, size_t len, uint32_t hz) {
+    snprintf(out, len, "%lu.%lu", (unsigned long)(hz / 1000000u),
+             (unsigned long)((hz / 100000u) % 10u));
+}
+
+static void draw_rec_scan(Canvas* c, LsApp* app) {
+    const LsSweep* s = &app->tel.sweep;
+    const int w = canvas_width(c);
+    const bool narrow = w < 100;
+    const int top = body_top();
+    const int bottom = body_bottom(c);
+    char a[16], b[16], line[40];
+
+    canvas_set_font(c, FontSecondary);
+    if(s->n > 1) {
+        sweep_mhz1(a, sizeof(a), s->lo_hz);
+        sweep_mhz1(b, sizeof(b), s->hi_hz);
+        snprintf(line, sizeof(line), "%s-%s", a, b);
+    } else {
+        snprintf(line, sizeof(line), "%s", SWEEP_BANDS[app->sweep_band].name);
+    }
+    canvas_draw_str(c, 2, top + 8, line);
+    canvas_draw_str_aligned(c, w - 2, top + 8, AlignRight, AlignBottom, s->on ? "RUN" : "STOP");
+
+    /* One bar per bin, height in dB above the floor; the target bin gets a
+       marker underneath so the number below has a place on the plot. */
+    const int g0 = top + 11;
+    const int g1 = bottom - 12;
+    const int gh = g1 - g0;
+    canvas_draw_line(c, 1, g1, w - 2, g1);
+    if(s->n > 0 && gh > 2) {
+        const int n = s->n > LS_SWEEP_BINS ? LS_SWEEP_BINS : (int)s->n;
+        int bw = (w - 4) / n;
+        if(bw < 1) bw = 1;
+        const int x0 = 2 + ((w - 4) - bw * n) / 2;
+        const uint32_t target = sweep_target(s);
+        const uint32_t bin = sweep_bin_hz(s);
+        for(int i = 0; i < n; i++) {
+            int h = (int)s->lv[i] * gh / SWEEP_FULL_DB;
+            if(h > gh) h = gh;
+            const int x = x0 + i * bw;
+            if(h > 0) canvas_draw_box(c, x, g1 - h, bw > 2 ? bw - 1 : bw, h);
+            const uint32_t f = s->lo_hz + bin * (uint32_t)i;
+            if(target && bin && target + bin / 2 >= f && target < f + bin / 2 + 1)
+                canvas_draw_box(c, x, g1 + 2, bw > 2 ? bw - 1 : bw, 2);
+        }
+    }
+
+    const uint32_t target = sweep_target(s);
+    if(target) {
+        ls_ui_mhz(a, sizeof(a), target);
+        const int32_t dbm = s->hit_hz ? s->hit_dbm : s->pk_dbm;
+        if(narrow)
+            snprintf(line, sizeof(line), "%s", a);
+        else
+            snprintf(line, sizeof(line), "%s %s %ld dBm", s->hit_hz ? "HIT" : "PK", a,
+                     (long)dbm);
+    } else {
+        snprintf(line, sizeof(line), "%s", s->on ? "listening..." : "not scanning");
+    }
+    canvas_draw_str(c, 2, bottom - 2, line);
+
+    const bool zoom = sweep_bin_hz(s) > SWEEP_USE_BIN_HZ;
+    if(narrow)
+        draw_status_line(c, s->on ? "OK stop" : "OK scan");
+    else if(!target)
+        draw_status_line(c, s->on ? "OK stop  Up/Dn band" : "OK scan  Up/Dn band");
+    else
+        draw_status_line(c, zoom ? "Hold OK: zoom in" : "Hold OK: use for REC");
+}
+
 static void draw_fm_scan(Canvas* c, LsApp* app) {
     LsTelemetry* t = &app->tel;
     canvas_set_font(c, FontSecondary);
@@ -2341,7 +2451,7 @@ static void rec_row_value(LsApp* app, int row, char* out, size_t len) {
         snprintf(out, len, "%s", app->link_up ? rec_phase_name(app) : "---");
         break;
     case REC_ROW_FREQ:
-        ls_ui_mhz(out, len, t->freq_hz);
+        ls_ui_mhz(out, len, (uint32_t)echo_get(app, ECHO_REC_FREQ, (int32_t)t->freq_hz));
         break;
     case REC_ROW_MOD:
         snprintf(out, len, "%s", echo_get(app, ECHO_REC_MOD, t->rec_mod) == 1 ? "FSK" : "OOK");
@@ -3195,7 +3305,7 @@ static void draw_set_about(Canvas* c, LsApp* app) {
 }
 
 static void edit_begin(LsApp* app) {
-    uint32_t hz = app->tel.freq_hz;
+    uint32_t hz = (uint32_t)echo_get(app, ECHO_REC_FREQ, (int32_t)app->tel.freq_hz);
     if(hz < 1000000) hz = 851012500;
     if(hz > 999999999u) hz = 999999999u;
     snprintf(app->edit, sizeof(app->edit), "%09lu", (unsigned long)hz);
@@ -3498,6 +3608,8 @@ static const char* page_title(LsApp* app) {
         return "CAPTURE";
     case PG_REC_FILES:
         return "FILES";
+    case PG_REC_SCAN:
+        return "SCAN";
     case PG_P25_SYS:
         return "SYSTEM";
     }
@@ -3553,6 +3665,9 @@ static void draw_app_page(Canvas* c, LsApp* app) {
         break;
     case PG_REC_FILES:
         draw_rec_files(c, app);
+        break;
+    case PG_REC_SCAN:
+        draw_rec_scan(c, app);
         break;
     case PG_P25_SYS:
         draw_p25_sys(c, app);
@@ -3849,12 +3964,37 @@ static void vfo_adjust(LsApp* app, int kind, int dir) {
     }
 }
 
+/* Every step used to be its own TUNE and its own retune on the P4, so a
+   held key queued a second of retunes and the value lagged behind. Steps
+   now move the number here and one REC FREQ goes out when the keys stop. */
+#define REC_FREQ_QUIET_MS 250
+#define REC_FREQ_MIN_HZ   24000000
+#define REC_FREQ_MAX_HZ   1766000000
+
+static void rec_freq_nudge(LsApp* app, int32_t delta_hz) {
+    int64_t f = (int64_t)(uint32_t)echo_get(app, ECHO_REC_FREQ, (int32_t)app->tel.freq_hz);
+    f += delta_hz;
+    if(f < REC_FREQ_MIN_HZ) f = REC_FREQ_MIN_HZ;
+    if(f > REC_FREQ_MAX_HZ) f = REC_FREQ_MAX_HZ;
+    echo_set(app, ECHO_REC_FREQ, (int32_t)f);
+    app->rec_freq_dirty = true;
+    app->rec_freq_due = furi_get_tick() + furi_ms_to_ticks(REC_FREQ_QUIET_MS);
+}
+
+static void rec_freq_flush(LsApp* app) {
+    if(!app->rec_freq_dirty || (int32_t)(furi_get_tick() - app->rec_freq_due) < 0) return;
+    app->rec_freq_dirty = false;
+    const uint32_t hz = (uint32_t)echo_get(app, ECHO_REC_FREQ, (int32_t)app->tel.freq_hz);
+    ls_link_send(app->link, "REC FREQ %lu", (unsigned long)hz);
+    echo_set(app, ECHO_REC_FREQ, (int32_t)hz);
+}
+
 static void rec_adjust(LsApp* app, int row, int dir) {
     LsTelemetry* t = &app->tel;
 
     switch(row) {
     case REC_ROW_FREQ:
-        vfo_tune(app, dir);
+        rec_freq_nudge(app, dir * (int32_t)STEPS[app->cfg.step_idx]);
         break;
     case REC_ROW_MOD: {
         const int v = echo_get(app, ECHO_REC_MOD, t->rec_mod) == 1 ? 0 : 1;
@@ -3910,6 +4050,57 @@ static void rec_adjust(LsApp* app, int row, int dir) {
     }
     default:
         break;
+    }
+}
+
+static void sweep_start(LsApp* app, uint32_t lo, uint32_t hi) {
+    if(lo < SWEEP_MIN_HZ) lo = SWEEP_MIN_HZ;
+    if(hi > SWEEP_MAX_HZ) hi = SWEEP_MAX_HZ;
+    ls_link_send(app->link, "REC SCAN %lu %lu %d", (unsigned long)lo, (unsigned long)hi,
+                 LS_SWEEP_BINS);
+}
+
+static void sweep_toggle(LsApp* app) {
+    if(!app->link_up) {
+        toast(app, "No radio");
+    } else if(app->tel.sweep.on) {
+        ls_link_send(app->link, "REC SCAN STOP");
+        toast(app, "Scan stopped");
+    } else {
+        const LsSweepBand* b = &SWEEP_BANDS[app->sweep_band];
+        sweep_start(app, b->lo, b->hi);
+        toast(app, "Scanning - transmit now");
+    }
+}
+
+static void sweep_band_step(LsApp* app, int dir) {
+    app->sweep_band = (app->sweep_band + dir + SWEEP_BAND_COUNT) % SWEEP_BAND_COUNT;
+    if(app->link_up && app->tel.sweep.on) {
+        const LsSweepBand* b = &SWEEP_BANDS[app->sweep_band];
+        sweep_start(app, b->lo, b->hi);
+    }
+}
+
+/* Hold OK. A wide sweep only knows the frequency to one bin, too coarse for
+   REC's +/-128 kHz window, so the first hold zooms to +/-1 MHz around it;
+   once the bins are narrow enough the next hold points REC there. */
+static void sweep_hold(LsApp* app) {
+    const LsSweep* s = &app->tel.sweep;
+    const uint32_t hz = sweep_target(s);
+    if(!app->link_up) {
+        toast(app, "No radio");
+    } else if(!hz) {
+        toast(app, "Nothing heard yet");
+    } else if(sweep_bin_hz(s) > SWEEP_USE_BIN_HZ) {
+        sweep_start(app, hz - SWEEP_ZOOM_HZ, hz + SWEEP_ZOOM_HZ);
+        toast(app, "Zoomed - transmit again");
+    } else {
+        ls_link_send(app->link, "REC SCAN USE %lu", (unsigned long)hz);
+        echo_set(app, ECHO_REC_FREQ, (int32_t)hz);
+        app->page = 0;
+        app->focus = REC_ROW_ARM;
+        app->editing = false;
+        toast(app, "REC tuned - OK to arm");
     }
 }
 
@@ -4101,6 +4292,9 @@ static void handle_launcher(LsApp* app, InputEvent* ev, bool press) {
 }
 
 static void handle_app(LsApp* app, InputEvent* ev, bool press) {
+    if(ev->type == InputTypePress) app->key_repeat = 0;
+    if(ev->type == InputTypeRepeat && app->key_repeat < 255) app->key_repeat++;
+
     const LsAppDef* d = &APPS[app->app];
     LsPage pg = cur_page(app);
 
@@ -4124,6 +4318,18 @@ static void handle_app(LsApp* app, InputEvent* ev, bool press) {
             handled = false;
         }
         if(handled) return;
+    }
+
+    if(pg == PG_REC && app->editing && app->focus == REC_ROW_FREQ && press &&
+       ev->key != InputKeyOk && ev->key != InputKeyBack) {
+        const bool mhz = ev->key == InputKeyLeft || ev->key == InputKeyRight;
+        const bool upward = ev->key == InputKeyUp || ev->key == InputKeyRight;
+        const int32_t unit = mhz ? 1000000 : (int32_t)STEPS[app->cfg.step_idx];
+        const int32_t accel = app->key_repeat > 20 ? (mhz ? 10 : 100) :
+                              app->key_repeat > 6  ? 10 :
+                                                     1;
+        rec_freq_nudge(app, (upward ? 1 : -1) * unit * accel);
+        return;
     }
 
     if(pg == PG_REC && app->editing) {
@@ -4390,13 +4596,16 @@ static void handle_app(LsApp* app, InputEvent* ev, bool press) {
                 rec_toggle_arm(app);
             } else if(app->focus == REC_ROW_MOD) {
                 rec_adjust(app, REC_ROW_MOD, 1);
+            } else if(app->focus == REC_ROW_FREQ) {
+                edit_begin(app);
             } else {
                 app->editing = true;
             }
         }
         if(ok_long) {
             if(app->focus == REC_ROW_FREQ) {
-                edit_begin(app);
+                app->editing = true;
+                toast(app, "Up/Dn step  L/R 1 MHz");
             } else if(app->focus == REC_ROW_THRESH) {
                 ls_link_send(app->link, "REC THRESH 0");
                 echo_set(app, ECHO_REC_THRESH, 0);
@@ -4411,6 +4620,13 @@ static void handle_app(LsApp* app, InputEvent* ev, bool press) {
                 toast(app, "Bandwidth auto");
             }
         }
+        break;
+
+    case PG_REC_SCAN:
+        if(ok) sweep_toggle(app);
+        if(ok_long) sweep_hold(app);
+        if(up) sweep_band_step(app, -1);
+        if(down) sweep_band_step(app, +1);
         break;
 
     case PG_REC_SIG:
@@ -4612,6 +4828,7 @@ static void handle_edit(LsApp* app, InputEvent* ev, bool press) {
             toast(app, "Too low");
         } else {
             ls_link_send(app->link, "FREQ %lu", (unsigned long)hz);
+            echo_set(app, ECHO_REC_FREQ, (int32_t)hz);
             app->screen = LsScreenApp;
         }
     } else if(ev->type == InputTypeShort && ev->key == InputKeyBack) {
@@ -4802,6 +5019,7 @@ int32_t lakeshark_p25_app(void* p) {
         rec_files_tick(app);
         p25_sys_tick(app);
         rec_files_load_tick(app);
+        rec_freq_flush(app);
 
         /* Marker sync only. map_tick is called AFTER the mutex is
            released - see below. */

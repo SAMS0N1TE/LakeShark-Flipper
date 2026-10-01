@@ -338,6 +338,36 @@ static void apply_kv(LsTelemetry* t, char* tok) {
         t->rec_cap_freq_hz = (uint32_t)strtoul(v, NULL, 10);
     else if((v = kv(tok, "rbr")))
         t->rec_bitrate = (uint32_t)strtoul(v, NULL, 10);
+    else if((v = kv(tok, "xon")))
+        t->sweep.on = atoi(v);
+    else if((v = kv(tok, "xn")))
+        t->sweep.n = atoi(v);
+    else if((v = kv(tok, "xlo")))
+        t->sweep.lo_hz = (uint32_t)strtoul(v, NULL, 10);
+    else if((v = kv(tok, "xhi")))
+        t->sweep.hi_hz = (uint32_t)strtoul(v, NULL, 10);
+    else if((v = kv(tok, "xfl")))
+        t->sweep.floor_dbm = atoi(v);
+    else if((v = kv(tok, "xpk")))
+        t->sweep.pk_hz = (uint32_t)strtoul(v, NULL, 10);
+    else if((v = kv(tok, "xpd")))
+        t->sweep.pk_dbm = atoi(v);
+    else if((v = kv(tok, "xev")))
+        t->sweep.events = atoi(v);
+    else if((v = kv(tok, "xht")))
+        t->sweep.hit_hz = (uint32_t)strtoul(v, NULL, 10);
+    else if((v = kv(tok, "xhd")))
+        t->sweep.hit_dbm = atoi(v);
+    else if((v = kv(tok, "xsp"))) {
+        /* 'a'..'z' is 0..25 dB above the floor, 'A'..'Z' 26..51. */
+        for(int i = 0; i < LS_SWEEP_BINS; i++) {
+            const char ch = v[i];
+            if(!ch) break;
+            t->sweep.lv[i] = (ch >= 'a' && ch <= 'z') ? (uint8_t)(ch - 'a') :
+                             (ch >= 'A' && ch <= 'Z') ? (uint8_t)(26 + ch - 'A') :
+                                                        0;
+        }
+    }
 
     else if((v = kv(tok, "ac")))
         t->ac_tracked = atoi(v);
@@ -381,6 +411,8 @@ static void parse_telemetry(LsLink* link, char* line) {
     /* Only ADS-B frames carry tv=; the level stays known across the others. */
     int32_t carry_tv = t->tts_volume;
 
+    LsSweep carry_sweep = t->sweep;
+
     int32_t carry_eq[7] = {
         t->eq_preset,
         t->eq_hp_hz,
@@ -405,6 +437,7 @@ static void parse_telemetry(LsLink* link, char* line) {
     t->eq_punch = carry_eq[4];
     t->eq_loud = carry_eq[5];
     t->eq_gr_db10 = carry_eq[6];
+    t->sweep = carry_sweep;
 
     t->nac_age_ms = -1;
     t->tg_age_ms = -1;
@@ -462,6 +495,7 @@ static void parse_eq_line(LsLink* link, char* line) {
     link->tel.eq_punch = t->eq_punch;
     link->tel.eq_loud = t->eq_loud;
     link->tel.eq_gr_db10 = t->eq_gr_db10;
+    link->tel.sweep = t->sweep;
     furi_mutex_release(link->lock);
 }
 

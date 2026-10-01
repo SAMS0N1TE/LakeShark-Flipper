@@ -66,6 +66,22 @@ typedef struct {
     bool pos_valid;
 } LsAircraft;
 
+#define LS_SWEEP_BINS 32
+
+/* The P4's SX1262 sweep, from its "& xon=" line. lv is dB above the floor. */
+typedef struct {
+    int32_t on;
+    int32_t n;
+    uint32_t lo_hz, hi_hz;
+    int32_t floor_dbm;
+    uint32_t pk_hz;
+    int32_t pk_dbm;
+    int32_t events;
+    uint32_t hit_hz;
+    int32_t hit_dbm;
+    uint8_t lv[LS_SWEEP_BINS];
+} LsSweep;
+
 typedef struct {
 
     LsMode mode;
@@ -93,6 +109,8 @@ typedef struct {
     int32_t eq_punch;
     int32_t eq_loud;
     int32_t eq_gr_db10;
+
+    LsSweep sweep;
 
     int32_t demod_mode;
     char demod_name[16];
