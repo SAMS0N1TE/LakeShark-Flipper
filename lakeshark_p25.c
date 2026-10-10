@@ -25,7 +25,7 @@
 /* Kept in step with fap_version in application.fam by hand; the
    build does not hand it to us, and a version the ABOUT page invents is
    worse than none. */
-#define LS_HEAD_VERSION "v2.9"
+#define LS_HEAD_VERSION "v2.10"
 #include "ls_cfg.h"
 #include "ls_dbg.h"
 
@@ -143,6 +143,9 @@ typedef enum {
     SET_DISPLAY,
     SET_ALERTS,
     SET_ABOUT,
+    SET_WIFI,
+    SET_SWEEP,
+    SET_DRONES,
     SET_COUNT,
 } LsSetPage;
 
@@ -194,7 +197,7 @@ static int alr_kind(int row) {
 }
 
 static const char* const SET_TITLES[SET_COUNT] =
-    {"LEVELS", "AUDIO", "LINK", "DEVICE", "DISPLAY", "ALERTS", "ABOUT"};
+    {"LEVELS", "AUDIO", "LINK", "DEVICE", "DISPLAY", "ALERTS", "ABOUT", "WI-FI", "SWEEP", "DRONES"};
 
 typedef enum {
     LsScreenLauncher,
@@ -367,6 +370,8 @@ typedef struct {
     char pending_mode[24];
     uint32_t pending_mode_until;
     uint32_t pending_mode_retry;
+    uint32_t aux_next;
+    uint32_t error_seen_seq;
 
     char modal_title[24];
     char modal_l1[32];
@@ -1899,7 +1904,15 @@ static void draw_diag(Canvas* c, LsApp* app) {
     }
 
     DIAG_ROW("Link", "%s", ls_link_state_str(app->link));
-    DIAG_ROW("Port", "%s", ls_link_port_name(app->link));
+    if(t->mode == LsModeFm) {
+        static const char* const fm_names[] = {
+            "NFM", "SCAN", "POCSAG", "WFM", "ACARS", "FLEX", "reserved",
+            "AM", "SAME (local)", "APRS (local)", "AIS (local)"};
+        DIAG_ROW("FM mode", "%s", (t->fm_submode >= 0 && t->fm_submode <= 10 && t->fm_submode != 6) ?
+                 fm_names[t->fm_submode] : "unknown");
+    } else {
+        DIAG_ROW("Port", "%s", ls_link_port_name(app->link));
+    }
     DIAG_ROW("Frames", "%lu", (unsigned long)frames);
     DIAG_ROW("Replies/bad", "%lu/%lu", (unsigned long)replies, (unsigned long)bad);
     DIAG_ROW("IQ B/s", "%lu", (unsigned long)t->iq_bytes_sec);
@@ -3294,13 +3307,76 @@ static void draw_set_about(Canvas* c, LsApp* app) {
     char v[24];
     uint32_t frames = 0;
     ls_link_stats(app->link, &frames, NULL, NULL);
-    snprintf(v, sizeof(v), "%s %lu fr", ls_link_port_name(app->link), (unsigned long)frames);
+    snprintf(v, sizeof(v), "proto %d / %lu fr", app->tel.protocol_version, (unsigned long)frames);
     ls_ui_row(c, y, "Link", v, false);
     y += LS_ROW_H;
 
     if(y + LS_ROW_H <= body_full(c)) {
-        snprintf(v, sizeof(v), "%d Hz / %d mem", app->cfg.tel_hz, app->mem_count);
-        ls_ui_row(c, y, "Telemetry", v, false);
+        ls_ui_row(c, y, "New", "FM IDs / AUX views", false);
+    }
+}
+
+/* Optional radio-side views. Never infer contacts or distance from RSSI. */
+static bool aux_live(LsApp* app) {
+    return app->link_up && app->tel.aux.version == 1 &&
+           furi_get_tick() - app->tel.aux.tick < furi_ms_to_ticks(6000);
+}
+
+static void aux_row(Canvas* c, int y, const char* label, const char* value, bool selected) {
+    char shown[48];
+    strlcpy(shown, value, sizeof(shown));
+    int available = canvas_width(c) - canvas_string_width(c, label) - 12;
+    size_t n = strlen(shown);
+    while(n && canvas_string_width(c, shown) > available) shown[--n] = '\0';
+    ls_ui_row(c, y, label, shown, selected);
+}
+
+static void draw_set_aux(Canvas* c, LsApp* app) {
+    if(!aux_live(app)) {
+        ls_ui_empty(c, "Telemetry unavailable", "Needs radio AUX patch");
+        return;
+    }
+    const LsAux* a = &app->tel.aux;
+    int y = body_top();
+    char v[48];
+    canvas_set_font(c, FontSecondary);
+    if(app->set_page == SET_WIFI) {
+        /* Scroll a long SSID, preserving the full wire value in memory. */
+        size_t len = strlen(a->wifi_ssid);
+        int available = canvas_width(c) - canvas_string_width(c, "SSID") - 12;
+        bool scroll = len && canvas_string_width(c, a->wifi_ssid) > available;
+        size_t off = scroll ? (furi_get_tick() / furi_ms_to_ticks(750)) % len : 0;
+        snprintf(v, sizeof(v), "%s", a->wifi_ssid[0] ? a->wifi_ssid + off : "--");
+        aux_row(c, y, "SSID", a->wifi_connected ? v : "offline", false);
+        aux_row(c, y + LS_ROW_H, "IP", a->wifi_ip[0] ? a->wifi_ip : "--", false);
+        snprintf(v, sizeof(v), "%d", a->wifi_saved);
+        aux_row(c, y + 2 * LS_ROW_H, "Saved", a->wifi_saved < 0 ? "busy" : v, false);
+        draw_status_line(c, a->wifi_connected ? "Wi-Fi connected" : "Wi-Fi disconnected");
+    } else if(app->set_page == SET_SWEEP) {
+        /* Counts and both contacts use the existing row-list scrolling. */
+        const int rows = (body_bottom(c) - y) / LS_ROW_H;
+        ls_ui_scroll(&app->list_top, app->focus, 7, rows);
+        static const char* const labels[] = {"Camera", "Bodycam", "Drone", "Tracker", "Attack", "Top 1", "Top 2"};
+        for(int r = 0; r < rows; r++) {
+            int i = app->list_top + r;
+            if(i >= 7) break;
+            if(i < 5) snprintf(v, sizeof(v), "%d", a->counts[i]);
+            else snprintf(v, sizeof(v), "%.21s", a->contacts[i - 5][0] ? a->contacts[i - 5] : "--");
+            static const char* const short_labels[] = {"Cam", "Body", "Drone", "Track", "Atk", "Top1", "Top2"};
+            aux_row(c, y + r * LS_ROW_H, ls_ui_portrait(c) ? short_labels[i] : labels[i], v, app->focus == i);
+        }
+        elements_scrollbar(c, app->focus, 7);
+        snprintf(v, sizeof(v), "%s OK %s", a->sweep_running ? "ON" : "OFF",
+                 a->sweep_muted ? "unmute" : "mute");
+        draw_status_line(c, v);
+    } else {
+        snprintf(v, sizeof(v), "%d", a->drones);
+        aux_row(c, y, ls_ui_portrait(c) ? "RID" : "RID count", v, false);
+        if(a->nearest_m >= 0) snprintf(v, sizeof(v), "%d m", a->nearest_m);
+        else strlcpy(v, "no GPS range", sizeof(v));
+        aux_row(c, y + LS_ROW_H, "Near", v, false);
+        aux_row(c, y + 2 * LS_ROW_H, "ID", a->drone_id[0] ? a->drone_id : "--", false);
+        draw_status_line(c, "Broadcast ID unverified");
     }
 }
 
@@ -3694,6 +3770,11 @@ static void draw_settings_page(Canvas* c, LsApp* app) {
         break;
     case SET_ALERTS:
         draw_set_alerts(c, app);
+        break;
+    case SET_WIFI:
+    case SET_SWEEP:
+    case SET_DRONES:
+        draw_set_aux(c, app);
         break;
     case SET_ABOUT:
         draw_set_about(c, app);
@@ -4517,6 +4598,7 @@ static void handle_app(LsApp* app, InputEvent* ev, bool press) {
 
     case PG_FM_SCAN:
         if(ok) {
+            ls_link_send(app->link, "FM scan");
             ls_link_send(app->link, "SCAN");
             toast(app, "Scan restarted");
         }
@@ -4755,6 +4837,14 @@ static void handle_settings(LsApp* app, InputEvent* ev, bool press) {
         break;
     }
 
+    if(app->set_page == SET_SWEEP) {
+        if(up) app->focus = (app->focus + 6) % 7;
+        if(down) app->focus = (app->focus + 1) % 7;
+        if(ok && aux_live(app)) {
+            ls_link_send(app->link, "SWEEP MUTE %d", !app->tel.aux.sweep_muted);
+            app->aux_next = 0;
+        }
+    }
     if(ok) {
         if(settings_row_is_value(app)) {
             app->editing = true;
@@ -4991,16 +5081,37 @@ int32_t lakeshark_p25_app(void* p) {
                 app->pending_transport);
         }
 
-        bool had = app->have_tel;
+        bool was_up = app->link_up;
         app->have_tel = ls_link_get(app->link, &app->tel);
         app->link_up = ls_link_is_up(app->link);
-        if(!had && app->have_tel) {
+        if(!was_up && app->link_up) {
             toast(app, "Linked to LakeShark");
-            /* Ask once per link. A radio that reboots behind our back
-               comes back as a fresh have_tel edge, so the version cannot go
-               stale without being asked again. */
+            /* Ask on the live-link edge, including after a telemetry timeout. */
+            ls_link_send(app->link, "PING");
             ls_link_send(app->link, "VER");
+            ls_link_send(app->link, "AUX");
+            app->aux_next = furi_get_tick() + furi_ms_to_ticks(2000);
             ls_alert(app, LsAlertLink);
+        }
+
+        if(app->link_up && app->tel.aux.version == 1 &&
+           app->screen == LsScreenSettings && app->set_page >= SET_WIFI &&
+           furi_get_tick() >= app->aux_next) {
+            ls_link_send(app->link, "AUX");
+            app->aux_next = furi_get_tick() + furi_ms_to_ticks(2000);
+        }
+        /* Refusals are replies, never successful local mode changes. */
+        char error[64];
+        uint32_t error_seq = ls_link_error(app->link, error, sizeof(error));
+        if(error_seq != app->error_seen_seq) {
+            app->error_seen_seq = error_seq;
+            if(!strncmp(error, "-ERR fm", 7)) toast(app, "FM mode refused");
+            else if(!strncmp(error, "-ERR sdr power", 14) ||
+                    !strncmp(error, "-ERR no sdr power", 17)) {
+                modal_clear(app);
+                toast(app, "SDR cycle refused");
+            } else if(!strncmp(error, "-ERR nomode", 11)) toast(app, "Radio mode refused");
+            else if(!strncmp(error, "-ERR sweep", 10)) toast(app, "SWEEP mute refused");
         }
 
         if(app->have_tel) poc_ingest(app);

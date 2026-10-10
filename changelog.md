@@ -1,3 +1,6 @@
+v2.10:
+Correct FM mode IDs, including reserved 6, AM 7, SAME 8, APRS 9 and AIS 10; unknown telemetry stays unknown. FM SCAN now selects scan mode before restarting it. FM refusals and refused SDR power cycling are shown. Protocol HELLO/PONG versions are retained and firmware is queried after reconnect. Settings adds Wi-Fi, counter-surveillance SWEEP (category counts, top contacts, alert mute) and DRONES (Remote ID count and GPS nearest), gated on fresh AUX v1 telemetry. The current radio needs the proposal in bench/flipper_link_sweep.patch; it is not applied automatically.
+
 v2.9:
 REC records FSK. The record page has a Mod row for OOK or FSK, and an FSK capture is saved with a CC1101 2-FSK preset set to the deviation and bit rate the radio measured, so it replays from the SubGHz app. The capture page shows the measured deviation, and a live capture is saved at the frequency it was taken on. Added a Trap 433.42 preset; new default presets are added to an existing preset list.
 FILES reads the radio's list every time it opens, newest first, with a progress bar, its position in the header and a scrollbar, and pages through any number of captures. A download is saved under the name of the file that was loaded, and a card write error says Write failed instead of SAVED. Needs LakeShark firmware with REC MOD.

@@ -36,10 +36,18 @@ typedef enum {
 #define LS_REC_NAME_MAX 28
 
 typedef enum {
-    LsFmListen,
-    LsFmScan,
-    LsFmPocsag,
-    LsFmWfm,
+    LsFmUnknown = -1,
+    LsFmListen = 0,
+    LsFmScan = 1,
+    LsFmPocsag = 2,
+    LsFmWfm = 3,
+    LsFmAcars = 4,
+    LsFmFlex = 5,
+    /* 6 is reserved on the radio. */
+    LsFmAm = 7,
+    LsFmSame = 8,
+    LsFmAprs = 9,
+    LsFmAis = 10,
 } LsFmMode;
 
 #define LS_AC_MAX 16
@@ -82,8 +90,23 @@ typedef struct {
     uint8_t lv[LS_SWEEP_BINS];
 } LsSweep;
 
+/* Optional AUX v1 snapshot. Separate from REC's SX1262 spectrum sweep. */
+typedef struct {
+    uint32_t tick;
+    int version;
+    int wifi_connected, wifi_saved;
+    char wifi_ssid[33], wifi_ip[16];
+    int sweep_running, sweep_muted, counts[5];
+    char contacts[2][24];
+    int drones, nearest_m;
+    char drone_id[21];
+} LsAux;
+
 typedef struct {
 
+    LsAux aux;
+    int protocol_version;
+    char board[40], health[20];
     LsMode mode;
     char mode_name[8];
     uint32_t freq_hz;
@@ -264,3 +287,6 @@ uint32_t ls_link_psys(LsLink* link, LsPsys* out);
 
 /* One PROF row, taken once. */
 bool ls_link_prof_take(LsLink* link, LsProfRow* out);
+
+/* Latest refusal, retained independently of later successful replies. */
+uint32_t ls_link_error(LsLink* link, char* out, size_t len);

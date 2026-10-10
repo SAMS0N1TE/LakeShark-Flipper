@@ -48,6 +48,8 @@ struct LsLink {
 
     char last_reply[64];
     uint32_t last_reply_tick;
+    char last_error[64];
+    uint32_t error_seq;
 
     /* The radio's own version string, kept apart from last_reply.
 
@@ -156,7 +158,46 @@ static void apply_kv(LsTelemetry* t, char* tok) {
         }
     }
 
-    if((v = kv(tok, "f")))
+    if((v = kv(tok, "av"))) {
+        t->aux.version = atoi(v);
+        t->aux.tick = furi_get_tick();
+    } else if((v = kv(tok, "wc")))
+        t->aux.wifi_connected = atoi(v);
+    else if((v = kv(tok, "wn")))
+        t->aux.wifi_saved = atoi(v);
+    else if((v = kv(tok, "ws")))
+        copy_field(t->aux.wifi_ssid, sizeof(t->aux.wifi_ssid), v);
+    else if((v = kv(tok, "wi")))
+        copy_field(t->aux.wifi_ip, sizeof(t->aux.wifi_ip), v);
+    else if((v = kv(tok, "sr")))
+        t->aux.sweep_running = atoi(v);
+    else if((v = kv(tok, "sm")))
+        t->aux.sweep_muted = atoi(v);
+    else if((v = kv(tok, "s0")))
+        t->aux.counts[0] = atoi(v);
+    else if((v = kv(tok, "s1")))
+        t->aux.counts[1] = atoi(v);
+    else if((v = kv(tok, "s2")))
+        t->aux.counts[2] = atoi(v);
+    else if((v = kv(tok, "s3")))
+        t->aux.counts[3] = atoi(v);
+    else if((v = kv(tok, "s4")))
+        t->aux.counts[4] = atoi(v);
+    else if((v = kv(tok, "c0")))
+        copy_field(t->aux.contacts[0], sizeof(t->aux.contacts[0]), v);
+    else if((v = kv(tok, "c1")))
+        copy_field(t->aux.contacts[1], sizeof(t->aux.contacts[1]), v);
+    else if((v = kv(tok, "dn")))
+        t->aux.drones = atoi(v);
+    else if((v = kv(tok, "dr")))
+        t->aux.nearest_m = atoi(v);
+    else if((v = kv(tok, "di")))
+        copy_field(t->aux.drone_id, sizeof(t->aux.drone_id), v);
+    else if((v = kv(tok, "board")))
+        strlcpy(t->board, v, sizeof(t->board));
+    else if((v = kv(tok, "rhs")))
+        copy_field(t->health, sizeof(t->health), v);
+    else if((v = kv(tok, "f")))
         t->freq_hz = (uint32_t)strtoul(v, NULL, 10);
     else if((v = kv(tok, "dmn")))
         copy_field(t->demod_name, sizeof(t->demod_name), v);
@@ -251,14 +292,17 @@ static void apply_kv(LsTelemetry* t, char* tok) {
         copy_field(t->err, sizeof(t->err), v);
 
     else if((v = kv(tok, "fm"))) {
-        if(!strcmp(v, "listen"))
-            t->fm_submode = LsFmListen;
-        else if(!strcmp(v, "scan"))
-            t->fm_submode = LsFmScan;
-        else if(!strcmp(v, "pocsag"))
-            t->fm_submode = LsFmPocsag;
-        else if(!strcmp(v, "wfm"))
-            t->fm_submode = LsFmWfm;
+        static const char* const names[] = {
+            "listen", "scan", "pocsag", "wfm", "acars", "flex",
+            "reserved", "am", "same", "aprs", "ais"};
+        t->fm_submode = LsFmUnknown;
+        for(size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+            if(i != 6 && !strcmp(v, names[i])) t->fm_submode = (int)i;
+        }
+        char* end;
+        long id = strtol(v, &end, 10);
+        if(end != v && !*end && id >= 0 && id <= 10 && id != 6)
+            t->fm_submode = (int)id;
     } else if((v = kv(tok, "sq")))
         t->squelch_tenths = atoi(v);
     else if((v = kv(tok, "so")))
@@ -412,6 +456,8 @@ static void parse_telemetry(LsLink* link, char* line) {
     int32_t carry_tv = t->tts_volume;
 
     LsSweep carry_sweep = t->sweep;
+    LsAux carry_aux = t->aux;
+    int carry_protocol = t->protocol_version;
 
     int32_t carry_eq[7] = {
         t->eq_preset,
@@ -438,6 +484,9 @@ static void parse_telemetry(LsLink* link, char* line) {
     t->eq_loud = carry_eq[5];
     t->eq_gr_db10 = carry_eq[6];
     t->sweep = carry_sweep;
+    t->aux = carry_aux;
+    t->protocol_version = carry_protocol;
+    t->fm_submode = LsFmUnknown;
 
     t->nac_age_ms = -1;
     t->tg_age_ms = -1;
@@ -496,6 +545,7 @@ static void parse_eq_line(LsLink* link, char* line) {
     link->tel.eq_loud = t->eq_loud;
     link->tel.eq_gr_db10 = t->eq_gr_db10;
     link->tel.sweep = t->sweep;
+    link->tel.aux = t->aux;
     furi_mutex_release(link->lock);
 }
 
@@ -649,6 +699,13 @@ static void handle_line(LsLink* link, char* line) {
             strncpy(link->radio_ver, line + 4, sizeof(link->radio_ver) - 1);
             link->radio_ver[sizeof(link->radio_ver) - 1] = '\0';
         }
+        if(!strncmp(line, "+PONG ", 6) || !strncmp(line, "+HELLO ", 7)) {
+            const char* p = line + (line[1] == 'P' ? 6 : 7);
+            link->parsed.protocol_version = atoi(p);
+            link->tel.protocol_version = link->parsed.protocol_version;
+            const char* ver = strstr(p, "LakeShark_");
+            if(ver) strlcpy(link->radio_ver, ver, sizeof(link->radio_ver));
+        }
         /* The answer to TTSVOL, asked when Settings opens. */
         if(!strncmp(line, "+OK tv=", 7)) {
             link->parsed.tts_volume = atoi(line + 7);
@@ -663,6 +720,14 @@ static void handle_line(LsLink* link, char* line) {
         if(ls_rec_load_ack_parse(line, &ack)) {
             link->rec_load_ack = ack;
             link->rec_load_ack_seq++;
+        }
+        if(line[0] == '-') {
+            strlcpy(link->last_error, line, sizeof(link->last_error));
+            link->error_seq++;
+            if(!strncmp(line, "-ERR unknown AUX", 16)) {
+                link->parsed.aux.version = 0;
+                link->tel.aux.version = 0;
+            }
         }
         strncpy(link->last_reply, line, sizeof(link->last_reply) - 1);
         link->last_reply[sizeof(link->last_reply) - 1] = '\0';
@@ -1118,6 +1183,14 @@ uint32_t ls_link_rec_load_reply(LsLink* link, LsRecLoadAck* out) {
     furi_mutex_acquire(link->lock, FuriWaitForever);
     if(out) *out = link->rec_load_ack;
     uint32_t seq = link->rec_load_ack_seq;
+    furi_mutex_release(link->lock);
+    return seq;
+}
+
+uint32_t ls_link_error(LsLink* link, char* out, size_t len) {
+    furi_mutex_acquire(link->lock, FuriWaitForever);
+    if(out && len) strlcpy(out, link->last_error, len);
+    uint32_t seq = link->error_seq;
     furi_mutex_release(link->lock);
     return seq;
 }
